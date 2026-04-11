@@ -509,6 +509,19 @@ void matterSetup() {
     return;
   }
 
+  // Write product/vendor name to NVS "chip-factory" namespace so the
+  // DeviceInstanceInfoProvider returns our name instead of "TEST_PRODUCT".
+  // These are read by ESP32FactoryDataProvider::GetProductName/GetVendorName.
+  {
+    nvs_handle_t h;
+    if (nvs_open("chip-factory", NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_str(h, "vendor-name", "Matter WLED");
+      nvs_set_str(h, "product-name", "WLED Bridge");
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+
   // Initialize default light states
   for (uint8_t i = 0; i < count; i++) {
     lightStates[i].powerOn = true;
@@ -524,8 +537,10 @@ void matterSetup() {
     memset(&pendingStates[i], 0, sizeof(PendingState));
   }
 
-  // Create Matter node
+  // Create Matter node — set the node_label so controllers (Google Home, etc.)
+  // show a meaningful name instead of "TEST_PRODUCT" or "Matter Device".
   esp_matter::node::config_t nodeCfg;
+  strncpy(nodeCfg.root_node.basic_information.node_label, "Matter WLED Bridge", 32);
   mNode = esp_matter::node::create(&nodeCfg, _attrCb, _identifyCb);
   if (!mNode) {
     ESP_LOGE("Matter", "Node creation failed");
