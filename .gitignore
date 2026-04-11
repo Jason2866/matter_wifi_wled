@@ -11,6 +11,7 @@ dependencies.lock
 # Generated sdkconfig files (IDF build output)
 sdkconfig
 sdkconfig.*
+!sdkconfig.defaults
 
 # IDE
 .idea/

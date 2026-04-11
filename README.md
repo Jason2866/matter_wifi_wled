@@ -1,13 +1,13 @@
 # Matter WiFi WLED Bridge
 
-ESP32-S3 firmware that bridges [Matter](https://csa-iot.org/all-solutions/matter/) smart home protocol to [WLED](https://kno.wled.ge/) LED controllers over WiFi. Each WLED device appears as a Matter Extended Color Light endpoint, controllable from Apple Home, Google Home, and Amazon Alexa.
+ESP32 firmware that bridges [Matter](https://csa-iot.org/all-solutions/matter/) smart home protocol to [WLED](https://kno.wled.ge/) LED controllers over WiFi. Each WLED device appears as a Matter Extended Color Light endpoint, controllable from Apple Home, Google Home, and Amazon Alexa.
 
 ```
 Apple Home / Google Home / Alexa
         |
     (Matter over WiFi)
         |
-    ESP32-S3 bridge  ──(HTTP JSON API)──>  WLED device 1
+     ESP32 bridge      ──(HTTP JSON API)──>  WLED device 1
         |                                  WLED device 2
     Web config UI                          WLED device N
 ```
@@ -25,9 +25,13 @@ Apple Home / Google Home / Alexa
 
 ## Hardware
 
-**Tested on:** ESP32-S3-DevKitC-1-N16R8 (16MB Flash, 8MB PSRAM)
+| Target | Board | Flash | Status |
+|--------|-------|-------|--------|
+| `esp32s3` (default) | ESP32-S3-DevKitC-1 | 8MB | Tested, recommended |
+| `esp32s3_16mb` | ESP32-S3-DevKitC-1-N16R8 | 16MB | Tested |
+| `esp32` | ESP32 DevKit | 8MB | Experimental |
 
-The Matter SDK requires an ESP32-S3 (or newer). Classic ESP32 is not supported due to flash/RAM constraints. ESP32-C3/C6 may work but have not been tested.
+All targets require **8MB flash** minimum (the firmware is ~2MB, and 8MB allows OTA with two 3MB app partitions). Classic ESP32 builds and links successfully but is considered experimental — IRAM is at ~82% utilisation. ESP32-C3/C6 may work but have not been tested.
 
 ## Quick Start
 
@@ -42,7 +46,8 @@ Visit the [web installer](https://netmindz.github.io/matter_wifi_wled/) in Chrom
 ```bash
 git clone https://github.com/netmindz/matter_wifi_wled.git
 cd matter_wifi_wled
-pio run -e esp32s3
+pio run -e esp32s3        # ESP32-S3 with 8MB flash (default)
+# or: pio run -e esp32    # Classic ESP32 with 8MB flash
 pio run -e esp32s3 -t upload
 ```
 
@@ -108,7 +113,7 @@ curl -X POST http://<device-ip>/api/matter/reset
 
 This erases Matter fabric data (`chip-config`, `chip-counters`, `CHIP_KVS`, `esp_matter_kvs`, `node` NVS namespaces) and restarts the device. WiFi credentials are preserved.
 
-## Partition Table (16MB Flash)
+## Partition Table (8MB Flash — Default)
 
 | Partition | Offset | Size |
 |-----------|--------|------|
@@ -116,8 +121,10 @@ This erases Matter fabric data (`chip-config`, `chip-counters`, `CHIP_KVS`, `esp
 | otadata | 0xE000 | 8KB |
 | app0 (OTA 0) | 0x10000 | 3MB |
 | app1 (OTA 1) | 0x310000 | 3MB |
-| spiffs | 0x610000 | 2MB |
-| coredump | 0x810000 | 64KB |
+| spiffs | 0x610000 | 256KB |
+| coredump | 0x650000 | 64KB |
+
+A 16MB variant is available in `partitions/matter_wled_16MB.csv` (used by the `esp32s3_16mb` environment) with the same app partitions plus a larger spiffs.
 
 ## Test Credentials
 

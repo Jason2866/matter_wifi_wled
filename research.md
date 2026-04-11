@@ -1,6 +1,6 @@
 # Matter WiFi WLED Bridge — Development Research Notes
 
-Hard-won discoveries from building a standalone Matter-to-WLED bridge on ESP32-S3.
+Hard-won discoveries from building a standalone Matter-to-WLED bridge on ESP32-S3 and ESP32.
 Intended as a reference for future development, debugging, and porting work.
 
 ---
@@ -25,14 +25,14 @@ Intended as a reference for future development, debugging, and porting work.
 
 This firmware exposes WLED LED controllers as **Matter Extended Color Light** endpoints
 (device type `0x010D`) over WiFi only (no BLE/Bluetooth required). It is a standalone
-ESP32-S3 bridge — not a WLED usermod.
+ESP32 bridge — not a WLED usermod.
 
 Built with:
-- PlatformIO environment: `esp32s3`
+- PlatformIO environments: `esp32s3` (default, 8MB), `esp32s3_16mb` (16MB), `esp32` (8MB, experimental)
 - Framework: `arduino, espidf` (dual framework — both run simultaneously)
 - Platform: `pioarduino/platform-espressif32 @ 55.03.37` (ESP-IDF 5.5.2)
 - ESP-IDF component: `espressif/esp_matter` (pulled via `idf_component.yml`)
-- Hardware: ESP32-S3-DevKitC-1-N16R8 (16MB Flash, 8MB PSRAM, OPI PSRAM)
+- Hardware: ESP32-S3-DevKitC-1 (8MB flash, default), ESP32-S3-DevKitC-1-N16R8 (16MB), ESP32 DevKit (8MB, experimental)
 
 Matter clusters exposed per endpoint:
 - `0x0006` On/Off
@@ -420,28 +420,64 @@ TXT: PI= PH=33 CM=1 D=3840 VP=65521+32768
 
 ### IRAM
 
-IRAM on ESP32-S3 with this build is at or near 100% utilisation. If adding new code
-marked `IRAM_ATTR`, the linker will error with `IRAM segment overflow`. Mitigation:
+IRAM usage varies by target:
+
+| Target | IRAM Used | IRAM Free | Notes |
+|--------|-----------|-----------|-------|
+| ESP32-S3 | ~100% | ~0 | Near limit — avoid new `IRAM_ATTR` code |
+| ESP32 (classic) | ~82% | ~24KB | Healthy margin |
+
+If adding new code marked `IRAM_ATTR`, the linker will error with `IRAM segment overflow`. Mitigation:
 - Remove `IRAM_ATTR` from non-ISR code
 - Set `CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y` in sdkconfig
 
 ### Flash usage
 
-Current firmware is ~1.98MB of a 3MB app partition (~63%). There is room for growth.
+Current firmware is ~1.95–1.98MB of a 3MB app partition (~62–63%). There is room for growth.
+All targets use 8MB flash minimum with OTA support (two 3MB app partitions).
 
 ### RAM usage
 
-~32% of 320KB SRAM used. 8MB PSRAM available for heap allocations.
+~31–32% of SRAM used on both targets. ESP32-S3 N16R8 variant has 8MB PSRAM available for
+heap allocations; classic ESP32 relies on internal 320KB SRAM only (no PSRAM unless board has it).
+
+### Multi-target support
+
+The firmware compiles and links successfully for both ESP32-S3 and classic ESP32:
+
+| Target | Flash (of 3MB) | IRAM | DRAM | Status |
+|--------|---------------|------|------|--------|
+| `esp32s3` | 63% (1.98MB) | ~100% | 32% | Production ready |
+| `esp32s3_16mb` | 63% (1.98MB) | ~100% | 32% | Production ready |
+| `esp32` | 62% (1.95MB) | 82% | 31% | Experimental |
+
+Classic ESP32 notes:
+- Bootloader offset is `0x1000` (vs `0x0` on ESP32-S3)
+- Flash mode is `dio` (vs `qio` on ESP32-S3)
+- Dual-core, so meets Matter's multi-thread requirements
+- No runtime testing yet — builds and links but not verified on hardware
 
 ### ESP32 compatibility
 
-Only ESP32-S3 is tested and supported. Classic ESP32 lacks the flash/RAM for the Matter
-SDK. ESP32-C3, C6, and H2 may work but have not been tested with this firmware.
+ESP32-S3 and classic ESP32 are supported. ESP32-C3, C6, and H2 may work but have not been
+tested with this firmware.
 
 ### Arduino `HTTPClient` not usable
 
 Arduino's `HTTPClient` pulls in `NetworkClientSecure` which depends on `ssl_client.cpp`.
 This doesn't link in dual-framework mode. Use ESP-IDF's `esp_http_client` instead.
+
+### Flash layout differences between targets
+
+The bootloader offset differs between ESP32 variants. This matters for the web installer
+and CI artifacts:
+
+| Target | Bootloader Offset | Flash Mode | Notes |
+|--------|------------------|------------|-------|
+| ESP32-S3 | `0x0` | qio | Uses merged binary for web install |
+| ESP32 (classic) | `0x1000` | dio | Different merge offset |
+
+Both use partition table at `0x8000`, OTA data at `0xE000`, and app at `0x10000`.
 
 ---
 
@@ -525,11 +561,12 @@ minimum is 1.
 
 | File | Purpose |
 |------|---------|
-| `platformio.ini` | Board, framework, dependencies, build flags |
+| `platformio.ini` | Board, framework, dependencies, build flags (3 envs: esp32s3, esp32s3_16mb, esp32) |
 | `CMakeLists.txt` | IDF component build, C++20 downgrade |
 | `sdkconfig.defaults` | FreeRTOS HZ, Arduino autostart, mbedtls HKDF |
 | `idf_component.yml` | ESP-IDF component manifest (esp_matter dependency) |
-| `partitions/matter_wled_16MB.csv` | 16MB flash layout |
+| `partitions/matter_wled_8MB.csv` | 8MB flash layout (default — used by esp32s3 and esp32) |
+| `partitions/matter_wled_16MB.csv` | 16MB flash layout (used by esp32s3_16mb) |
 | `matter_gcc14_compat.h` | GCC 14 compat header (placeholder) |
 
 ### Build scripts
@@ -564,4 +601,5 @@ minimum is 1.
 |------|--------|
 | `managed_components/` | Auto-downloaded by IDF Component Manager; reverts on next build |
 | `sdkconfig.esp32s3` | Generated by CMake; overwritten on every build |
+| `sdkconfig.esp32` | Generated by CMake; overwritten on every build |
 | `dependencies.lock` | Generated by IDF Component Manager |

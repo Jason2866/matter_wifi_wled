@@ -137,7 +137,7 @@
 <body>
   <div class="container">
     <h1>Matter WLED Bridge</h1>
-    <p class="subtitle">ESP32-S3 Matter &rarr; WLED bridge</p>
+    <p class="subtitle">ESP32 / ESP32-S3 Matter &rarr; WLED bridge</p>
 
     <div class="browser-warning" id="browser-warning">
       Web Serial is not supported in this browser.<br />
@@ -148,7 +148,8 @@
       <div class="install-box">
         <h2>Install Firmware</h2>
         <p class="note">
-          Connect your ESP32-S3 via USB, then click the button below.
+          Connect your ESP32 or ESP32-S3 via USB, then click the button below.<br />
+          The correct firmware will be selected automatically based on your chip.
         </p>
         <esp-web-install-button manifest="manifest.json">
           <button slot="activate">Install Matter WLED Bridge</button>
