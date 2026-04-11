@@ -312,18 +312,20 @@ reflects the state and `current_level` retains its last-known brightness per Mat
 
 ## Device Naming in Matter
 
-### Problem: devices appear as "TEST_PRODUCT" or "Matter Device"
+### Problem: all devices appear with the same name
 
-After pairing, devices appeared with generic names in Google Home instead of our custom names.
+With a flat multi-endpoint topology (all Extended Color Light endpoints on the root node),
+every endpoint shares the root node's Basic Information cluster. Controllers like Google
+Home, Apple Home, and Alexa display the same name ("Matter WLED Bridge") for all lights.
+The `fixed_label` (0x0040) and `user_label` (0x0041) clusters are **not** used by any
+major controller for display names.
 
-### Root cause
+### Root-level naming (still applies to the bridge root node)
 
 The `product_name` attribute on the root node's Basic Information cluster is
 `MANAGED_INTERNALLY` — it's read from `DeviceInstanceInfoProvider`, not from the attribute
 database. The default `ESP32FactoryDataProvider` reads from NVS namespace `"chip-factory"`,
 keys `"vendor-name"` and `"product-name"`. When these don't exist, it returns "TEST_PRODUCT".
-
-### Architecture of Matter naming
 
 | Attribute | Location | Writable | Storage |
 |-----------|----------|----------|---------|
@@ -331,32 +333,74 @@ keys `"vendor-name"` and `"product-name"`. When these don't exist, it returns "T
 | `product_name` | Basic Information cluster on root endpoint | No (MANAGED_INTERNALLY) | `chip-factory` NVS namespace, key `"product-name"` |
 | `vendor_name` | Basic Information cluster on root endpoint | No (MANAGED_INTERNALLY) | `chip-factory` NVS namespace, key `"vendor-name"` |
 
-For **bridged** endpoints (if switching to bridge architecture later): `product_name`,
-`vendor_name`, `node_label` on `bridged_device_basic_information` cluster are NOT managed
-internally and can be set via the attribute API.
+### Solution: Matter Bridge architecture
 
-### The fix
+The **only** way to get per-endpoint names is to use a Matter Bridge topology:
 
-Two changes in `matterSetup()`:
+```
+Endpoint 0  — Root Node (Basic Information: "Matter WLED Bridge")
+Endpoint 1  — Aggregator (device type 0x000E)
+Endpoint 2  — Bridged Node (0x0013) + Extended Color Light (0x010D)
+                └── bridged_device_basic_information (0x0039)
+                    ├── node_label = "WLED-window-blue"
+                    ├── product_name = "WLED Light"
+                    ├── unique_id = "wled-0-WLED-window-blue"
+                    └── reachable = true
+Endpoint 3  — Bridged Node + Extended Color Light
+                └── bridged_device_basic_information
+                    ├── node_label = "HD-WF2"
+                    ...
+```
 
-1. Set `node_label` via the config struct:
-   ```cpp
-   esp_matter::node::config_t nodeCfg;
-   strncpy(nodeCfg.root_node.basic_information.node_label, "Matter WLED Bridge", 32);
-   ```
+Each bridged node has its own `bridged_device_basic_information` cluster (0x0039) with
+attributes that controllers read for display names:
+- **`node_label` (0x0005)** — the primary display name (writable, nonvolatile — controllers can rename it)
+- **`product_name` (0x0003)** — secondary descriptor, NOT managed internally on bridged endpoints
+- **`unique_id` (0x0012)** — must be unique per bridged device for controller deduplication
+- **`reachable` (0x0011)** — boolean, set to true
 
-2. Write vendor/product name to NVS before node creation:
-   ```cpp
-   nvs_handle_t h;
-   if (nvs_open("chip-factory", NVS_READWRITE, &h) == ESP_OK) {
-       nvs_set_str(h, "vendor-name", "Matter WLED");
-       nvs_set_str(h, "product-name", "WLED Bridge");
-       nvs_commit(h);
-       nvs_close(h);
-   }
-   ```
+### Implementation details
 
-**Note:** Requires Matter reset and re-pair for controllers to pick up new names.
+Key esp_matter API calls in `matterSetup()`:
+
+```cpp
+// 1. Create aggregator endpoint
+esp_matter::endpoint::aggregator::config_t aggCfg;
+mAggregator = esp_matter::endpoint::aggregator::create(
+    mNode, &aggCfg, esp_matter::ENDPOINT_FLAG_NONE, nullptr);
+
+// 2. For each light, create bridged_node + composite extended_color_light
+esp_matter::endpoint::bridged_node::config_t bridgedCfg;
+bridgedCfg.bridged_device_basic_information.reachable = true;
+esp_matter::endpoint_t *ep = esp_matter::endpoint::bridged_node::create(
+    mNode, &bridgedCfg, esp_matter::ENDPOINT_FLAG_BRIDGE, nullptr);
+esp_matter::endpoint::set_parent_endpoint(ep, mAggregator);
+esp_matter::endpoint::extended_color_light::add(ep, &lightCfg);
+
+// 3. Add name attributes to bridged_device_basic_information cluster
+esp_matter::cluster_t *bdbi = esp_matter::cluster::get(ep, 0x0039);
+esp_matter::cluster::bridged_device_basic_information::attribute::create_node_label(
+    bdbi, label, strlen(label));
+esp_matter::cluster::bridged_device_basic_information::attribute::create_product_name(
+    bdbi, prodName, strlen(prodName));
+esp_matter::cluster::bridged_device_basic_information::attribute::create_unique_id(
+    bdbi, uid, strlen(uid));
+```
+
+### Important caveats
+
+- `bridged_node::create()` automatically ORs in `ENDPOINT_FLAG_DESTROYABLE` — no need to
+  set it explicitly.
+- `bridged_node::create()` creates the `bridged_device_basic_information` cluster but only
+  adds `feature_map`, `unique_id`, `cluster_revision`, and `reachable`. The `node_label`,
+  `product_name`, and `unique_id` **value** must be added manually via `attribute::create_*`
+  calls. (The `unique_id` attribute shell exists but is empty — our `create_unique_id()`
+  call gets a warning "already exists" but the value is still set correctly.)
+- **Changing from flat to bridge topology requires a Matter factory reset and re-pair.**
+  The controller's subscription model is based on the endpoint structure seen during
+  commissioning.
+- The `node_label` is writable and nonvolatile — once paired, the user can rename the
+  device in their controller app, and the rename persists across reboots.
 
 ---
 
@@ -398,12 +442,16 @@ Namespaces erased:
 |-----------|----------------|
 | `chip-config` | Commissioning state, fabric info |
 | `chip-counters` | Boot/reboot counters |
+| `chip-factory` | Serial, certs, passcode, discriminator, vendor/product name |
 | `CHIP_KVS` | Fabric keys, ACLs, group keys |
 | `esp_matter_kvs` | Persisted cluster attribute values |
 | `node` | Endpoint ID counter |
 
-`chip-factory` is deliberately **not** erased — it holds device attestation certificates
-and the passcode/discriminator, which should survive recommissioning.
+`chip-factory` **is** erased because our firmware writes `vendor-name` and `product-name`
+to it on every boot. Including it in the erase ensures a clean slate when re-pairing,
+especially after topology changes (e.g., switching from flat to bridge architecture).
+The passcode and discriminator are hardcoded defaults (test values), so erasing them has
+no impact — they are regenerated on next boot.
 
 The CHIP SDK's own `ConfigurationManagerImpl::DoFactoryReset()` does the same thing but
 also calls `esp_wifi_restore()` (which wipes WiFi credentials). We bypass it and use raw
@@ -627,7 +675,7 @@ minimum is 1.
 | File | Purpose |
 |------|---------|
 | `src/main.cpp` | Entry point, setup/loop, ArduinoOTA |
-| `src/matter_manager.cpp` | Matter stack: node, endpoints, callbacks, pairing codes |
+| `src/matter_manager.cpp` | Matter stack: bridge topology (aggregator + bridged nodes), callbacks, pairing codes, NVS naming |
 | `src/web_ui.cpp` | Web server, REST API, WiFi manager, esp_netif helpers |
 | `src/config_store.cpp` | NVS persistence for light configuration |
 | `src/wled_discovery.cpp` | mDNS WLED device discovery |

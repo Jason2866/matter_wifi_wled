@@ -1,21 +1,25 @@
 # Matter WiFi WLED Bridge
 
-ESP32 firmware that bridges [Matter](https://csa-iot.org/all-solutions/matter/) smart home protocol to [WLED](https://kno.wled.ge/) LED controllers over WiFi. Each WLED device appears as a Matter Extended Color Light endpoint, controllable from Apple Home, Google Home, and Amazon Alexa.
+ESP32 firmware that bridges [Matter](https://csa-iot.org/all-solutions/matter/) smart home protocol to [WLED](https://kno.wled.ge/) LED controllers over WiFi. Uses a **Matter Bridge architecture** so each WLED device appears as an independently named light in Apple Home, Google Home, and Amazon Alexa.
 
 ```
 Apple Home / Google Home / Alexa
         |
     (Matter over WiFi)
         |
-     ESP32 bridge      ──(HTTP JSON API)──>  WLED device 1
-        |                                  WLED device 2
-    Web config UI                          WLED device N
+     ESP32 bridge (Aggregator)
+        ├── Bridged Node 1 ──(HTTP JSON API)──> WLED device 1
+        ├── Bridged Node 2 ──(HTTP JSON API)──> WLED device 2
+        └── Bridged Node N ──(HTTP JSON API)──> WLED device N
+        |
+    Web config UI
 ```
 
 ## Features
 
 - **Matter-compatible** — works with Apple Home, Google Home, and Alexa
-- **Up to 16 WLED lights** — each exposed as an independent Matter endpoint
+- **Bridge architecture** — each WLED device gets its own name in smart home apps
+- **Up to 16 WLED lights** — each exposed as an independent bridged endpoint
 - **Full color control** — hue/saturation, CIE XY, and color temperature (mireds)
 - **mDNS auto-discovery** — finds WLED devices on your network automatically
 - **Web configuration UI** — captive portal for WiFi setup, device management
@@ -74,12 +78,24 @@ Default pairing code: `34970112332` (test credentials — change before producti
 
 The firmware uses PlatformIO's **dual framework mode** (`arduino` + `espidf`). Arduino provides the web server, OTA, and WiFi management. ESP-IDF compiles the Matter SDK (`esp_matter`) from source via the IDF Component Manager, generating a proper sdkconfig with BLE disabled.
 
+### Matter Bridge Topology
+
+```
+Endpoint 0  — Root Node (Basic Information)
+Endpoint 1  — Aggregator (device type 0x000E, bridge container)
+Endpoint 2  — Bridged Node + Extended Color Light (WLED device 1)
+Endpoint 3  — Bridged Node + Extended Color Light (WLED device 2)
+  ...
+```
+
+Each bridged node carries a `bridged_device_basic_information` cluster (0x0039) with per-endpoint `node_label`, `product_name`, and `unique_id` attributes. This is what allows controllers like Google Home to display each WLED device with its own name instead of a single "WLED Bridge".
+
 ### Source Files
 
 | File | Purpose |
 |------|---------|
 | `src/main.cpp` | Entry point, setup/loop, ArduinoOTA |
-| `src/matter_manager.cpp` | Matter stack: node, endpoints, attribute callbacks |
+| `src/matter_manager.cpp` | Matter stack: bridge topology, endpoints, attribute callbacks |
 | `src/web_ui.cpp` | Web server, REST API, captive portal, WiFi management |
 | `src/config_store.cpp` | NVS persistence for light configuration |
 | `src/wled_discovery.cpp` | mDNS discovery of WLED devices on the network |
@@ -112,7 +128,7 @@ Reset Matter commissioning state without losing WiFi credentials:
 curl -X POST http://<device-ip>/api/matter/reset
 ```
 
-This erases Matter fabric data (`chip-config`, `chip-counters`, `CHIP_KVS`, `esp_matter_kvs`, `node` NVS namespaces) and restarts the device. WiFi credentials are preserved.
+This erases Matter fabric data (`chip-config`, `chip-counters`, `chip-factory`, `CHIP_KVS`, `esp_matter_kvs`, `node` NVS namespaces) and restarts the device. WiFi credentials are preserved.
 
 ## Partition Table (8MB Flash — Default)
 
