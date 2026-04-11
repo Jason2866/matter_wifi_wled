@@ -365,10 +365,15 @@ static void syncToMatter() {
     esp_matter::attribute::update(epId, MATTER_CL_ON_OFF,
                                   MATTER_AT_ON_OFF, &val);
 
-    // Level
-    val = esp_matter_nullable_uint8(curOn ? curBri : (uint8_t)0);
-    esp_matter::attribute::update(epId, MATTER_CL_LEVEL_CTRL,
-                                  MATTER_AT_CURRENT_LEVEL, &val);
+    // Level — only update when on.  The Matter Level Control cluster has a
+    // minimum value of 1; pushing 0 causes error 0x87 (CONSTRAINT_ERROR).
+    // When the light is off, the on_off attribute already reflects the state
+    // and current_level retains its last-known brightness (per Matter spec).
+    if (curOn && curBri > 0) {
+      val = esp_matter_nullable_uint8(curBri);
+      esp_matter::attribute::update(epId, MATTER_CL_LEVEL_CTRL,
+                                    MATTER_AT_CURRENT_LEVEL, &val);
+    }
 
     // Color — convert RGB to Matter hue/saturation
     uint8_t matterHue, matterSat;

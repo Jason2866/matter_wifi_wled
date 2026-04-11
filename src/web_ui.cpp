@@ -23,6 +23,7 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <esp_netif.h>
 
 static WebServer server(80);
 static DNSServer dnsServer;
@@ -32,6 +33,59 @@ static bool serverStarted = false;
 // WiFi credentials stored in NVS
 static String wifiSSID;
 static String wifiPass;
+
+// ── WiFi connectivity check ─────────────────────────────────────────────────
+// Once Matter starts, it takes ownership of the WiFi esp_netif interface.
+// Arduino's WiFi.status() may report WIFI_MODE_NULL (state 254) even though
+// the device is fully connected at the IP layer.  Query esp_netif directly
+// to get the true connection state (same approach as WLED-MM's Network.cpp
+// with the externalWiFiManager flag).
+bool isWiFiConnected() {
+  // If Matter hasn't started yet, Arduino's WiFi object is still authoritative
+  if (!matterIsStarted()) {
+    return WiFi.status() == WL_CONNECTED;
+  }
+  // After Matter starts, query esp_netif directly
+  esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (sta) {
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Get the STA IP address string, querying esp_netif when Matter owns WiFi.
+static String getStaIPString() {
+  if (!matterIsStarted()) {
+    return WiFi.localIP().toString();
+  }
+  esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+  if (sta) {
+    esp_netif_ip_info_t ip_info;
+    if (esp_netif_get_ip_info(sta, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+      char buf[16];
+      esp_ip4addr_ntoa(&ip_info.ip, buf, sizeof(buf));
+      return String(buf);
+    }
+  }
+  return String("0.0.0.0");
+}
+
+// Get the SSID, falling back to stored credentials when Arduino can't report it.
+static String getStaSSID() {
+  if (!matterIsStarted()) {
+    return WiFi.SSID();
+  }
+  // After Matter takes over WiFi, WiFi.SSID() may return empty.
+  // Use the stored credential as fallback.
+  String ssid = WiFi.SSID();
+  if (ssid.length() == 0) {
+    ssid = wifiSSID;
+  }
+  return ssid;
+}
 
 // ---- HTML served from PROGMEM ----
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -591,7 +645,10 @@ static void setupRoutes() {
   // Status API
   server.on("/api/status", HTTP_GET, []() {
     JsonDocument doc;
-    doc["wifi"] = WiFi.isConnected() ? WiFi.SSID() : "Not connected";
+    doc["wifi"] = isWiFiConnected() ? getStaSSID() : "Not connected";
+    if (isWiFiConnected()) {
+      doc["ip"] = getStaIPString();
+    }
     doc["apMode"] = apMode;
 
     if (configStore.getLightCount() == 0) {
@@ -822,14 +879,12 @@ void webSetup() {
   loadWifiCreds();
 
   if (wifiSSID.length() > 0) {
-    // Try to connect to stored WiFi
+    // Try to connect to stored WiFi — STA only (no softAP).
+    // Starting a softAP here causes WiFi mode toggling that conflicts with
+    // Matter's WiFi driver and mDNS binding.
     ESP_LOGI("Web", "Connecting to WiFi: %s", wifiSSID.c_str());
-    WiFi.mode(WIFI_AP_STA);
+    WiFi.mode(WIFI_STA);
     WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
-
-    // Also start a temporary AP for fallback access
-    WiFi.softAP("MatterWLED-Setup", "");
-    apMode = true;
 
     // Wait for connection (non-blocking, with timeout)
     unsigned long start = millis();
@@ -840,10 +895,13 @@ void webSetup() {
     if (WiFi.status() == WL_CONNECTED) {
       ESP_LOGI("Web", "WiFi connected: %s", WiFi.localIP().toString().c_str());
       apMode = false;
-      WiFi.softAPdisconnect(true);
       webOnWifiConnected();
     } else {
-      ESP_LOGW("Web", "WiFi connection failed, staying in AP mode");
+      // Failed to connect — fall back to AP mode for configuration
+      ESP_LOGW("Web", "WiFi connection failed, starting AP mode for setup");
+      WiFi.mode(WIFI_AP);
+      WiFi.softAP("MatterWLED-Setup", "");
+      apMode = true;
     }
   } else {
     // No WiFi configured - start AP mode only
@@ -873,15 +931,18 @@ void webLoop() {
   // Process incoming HTTP requests
   server.handleClient();
 
-  // Check if WiFi reconnected (was in AP+STA mode)
+  // Check if WiFi reconnected (use esp_netif-aware helper, not WiFi.status())
   static bool wasConnected = false;
-  if (!wasConnected && WiFi.status() == WL_CONNECTED) {
+  bool nowConnected = isWiFiConnected();
+  if (!wasConnected && nowConnected) {
     wasConnected = true;
-    apMode = false;
-    WiFi.softAPdisconnect(true);
-    ESP_LOGI("Web", "WiFi connected: %s", WiFi.localIP().toString().c_str());
+    if (apMode) {
+      apMode = false;
+      WiFi.softAPdisconnect(true);
+    }
+    ESP_LOGI("Web", "WiFi connected: %s", getStaIPString().c_str());
     webOnWifiConnected();
-  } else if (wasConnected && WiFi.status() != WL_CONNECTED) {
+  } else if (wasConnected && !nowConnected) {
     wasConnected = false;
   }
 }

@@ -48,7 +48,10 @@ void setup() {
   webSetup();
 
   // 3b. Setup ArduinoOTA for network-based firmware upload from PlatformIO
+  //     Disable ArduinoOTA's built-in mDNS — it conflicts with CHIP's minimal
+  //     mDNS (both try to bind UDP port 5353).  OTA still works by IP address.
   ArduinoOTA.setHostname("matterwled");
+  ArduinoOTA.setMdnsEnabled(false);
   ArduinoOTA.onStart([]() {
     ESP_LOGI("OTA", "OTA update starting...");
     wledOutput.stop();  // Stop WLED output during OTA

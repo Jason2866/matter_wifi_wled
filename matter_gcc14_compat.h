@@ -1,19 +1,12 @@
 // matter_gcc14_compat.h — Force-included in every TU via -include.
 //
-// GCC 14 two-phase lookup workaround for CHIP SDK
-// The CHIP SDK defines chip::to_underlying() in TypeTraits.h and calls it
-// without qualification in template code.  GCC 14's stricter two-phase
-// name lookup can't find it via ADL because the function lives in the
-// 'chip' namespace but the enum argument types are in child namespaces.
-// For TUs with the CHIP SDK on their include path we pull in TypeTraits.h
-// early; for others this is a harmless no-op.
+// Originally provided chip::to_underlying as a workaround for GCC 14 + C++23
+// two-phase name lookup issues.  Now that the CMakeLists.txt downgrades the
+// C++ standard from gnu++2b to gnu++20 (matching WLED-MM PR #5456), and the
+// post-script patches TypeTraits.h, the to_underlying definition here is no
+// longer needed and would cause a redefinition error.
+//
+// This header is kept as a placeholder for any future GCC / CHIP SDK compat
+// workarounds that need to be force-included.
 
 #pragma once
-
-#ifdef __cplusplus
-
-#if __has_include(<lib/support/TypeTraits.h>)
-#include <lib/support/TypeTraits.h>
-#endif
-
-#endif // __cplusplus

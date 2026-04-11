@@ -4,13 +4,14 @@
  * Sends HTTP POST requests to WLED devices' /json/state endpoint
  * to control color, brightness, and power state.
  *
- * Uses the Arduino HTTPClient library for HTTP communication.
+ * Uses ESP-IDF's esp_http_client (native, no Arduino SSL dependency).
  */
 
 #include "wled_output.h"
+#include "web_ui.h"
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_http_client.h>
 
 WledOutput wledOutput;
 
@@ -47,17 +48,16 @@ bool WledOutput::stateChanged(uint8_t index, const LightState& state) const {
 }
 
 bool WledOutput::sendToWled(const LightConfig& cfg, const LightState& state) {
-  if (!WiFi.isConnected()) return false;
+  if (!isWiFiConnected()) return false;
   if (cfg.wledHost[0] == '\0') return false;
 
   // Build the URL
-  String url = "http://";
-  url += cfg.wledHost;
+  char url[128];
   if (cfg.wledPort != 80) {
-    url += ":";
-    url += cfg.wledPort;
+    snprintf(url, sizeof(url), "http://%s:%u/json/state", cfg.wledHost, cfg.wledPort);
+  } else {
+    snprintf(url, sizeof(url), "http://%s/json/state", cfg.wledHost);
   }
-  url += "/json/state";
 
   // Build JSON payload
   JsonDocument doc;
@@ -91,34 +91,44 @@ bool WledOutput::sendToWled(const LightConfig& cfg, const LightState& state) {
   }
 
   // Serialize
-  String payload;
-  serializeJson(doc, payload);
+  char payload[256];
+  size_t payloadLen = serializeJson(doc, payload, sizeof(payload));
 
-  // Send HTTP POST
-  HTTPClient http;
-  http.setConnectTimeout(HTTP_TIMEOUT_MS);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  // Send HTTP POST using esp_http_client
+  esp_http_client_config_t config = {};
+  config.url = url;
+  config.method = HTTP_METHOD_POST;
+  config.timeout_ms = HTTP_TIMEOUT_MS;
 
-  if (!http.begin(url)) {
-    ESP_LOGW("WLED", "HTTP begin failed for %s", cfg.wledHost);
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) {
+    ESP_LOGW("WLED", "HTTP client init failed for %s", cfg.wledHost);
     return false;
   }
 
-  http.addHeader("Content-Type", "application/json");
-  int httpCode = http.POST(payload);
-  http.end();
+  esp_http_client_set_header(client, "Content-Type", "application/json");
+  esp_http_client_set_post_field(client, payload, payloadLen);
 
-  if (httpCode == 200) {
+  esp_err_t err = esp_http_client_perform(client);
+  int status = esp_http_client_get_status_code(client);
+  esp_http_client_cleanup(client);
+
+  if (err != ESP_OK) {
+    ESP_LOGW("WLED", "HTTP POST to %s failed: %s", cfg.wledHost, esp_err_to_name(err));
+    return false;
+  }
+
+  if (status == 200) {
     return true;
   } else {
-    ESP_LOGW("WLED", "HTTP POST to %s returned %d", cfg.wledHost, httpCode);
+    ESP_LOGW("WLED", "HTTP POST to %s returned %d", cfg.wledHost, status);
     return false;
   }
 }
 
 void WledOutput::update(const LightConfig* lights, const LightState* states, uint8_t count) {
   if (!initialized) return;
-  if (!WiFi.isConnected()) return;
+  if (!isWiFiConnected()) return;
 
   for (uint8_t i = 0; i < count; i++) {
     if (!lights[i].active) continue;

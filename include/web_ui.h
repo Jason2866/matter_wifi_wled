@@ -18,3 +18,8 @@ void webLoop();
 
 // Call when WiFi STA connects successfully
 void webOnWifiConnected();
+
+// WiFi connectivity check that works after Matter takes over esp_netif.
+// Arduino's WiFi.status()/WiFi.isConnected() report disconnected (state 254)
+// once Matter owns the WiFi interface.  This queries esp_netif directly.
+bool isWiFiConnected();

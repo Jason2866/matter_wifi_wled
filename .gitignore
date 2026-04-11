@@ -8,6 +8,10 @@ src/idf_component.yml
 managed_components/
 dependencies.lock
 
+# Generated sdkconfig files (IDF build output)
+sdkconfig
+sdkconfig.*
+
 # IDE
 .idea/
 .vscode/
