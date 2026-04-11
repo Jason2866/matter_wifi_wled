@@ -166,9 +166,44 @@ After this fix, **Google Home pairing succeeded and control works**.
 
 ### ArduinoOTA mDNS conflict
 
-`ArduinoOTA.begin()` calls `MDNS.begin()` which conflicts with the CHIP SDK's minimal
-mDNS implementation (both bind UDP port 5353). Fixed by calling
-`ArduinoOTA.setMdnsEnabled(false)` before `ArduinoOTA.begin()`.
+`ArduinoOTA.begin()` calls `MDNS.begin()` which conflicts with the ESP-IDF mDNS service
+(both bind UDP port 5353). Fixed by calling `ArduinoOTA.setMdnsEnabled(false)` before
+`ArduinoOTA.begin()`.
+
+### Shared mDNS stack (`CONFIG_USE_MINIMAL_MDNS=n`)
+
+CHIP/Matter ships with two mDNS implementations for ESP32:
+
+1. **"Minimal mDNS"** — CHIP's own C++ mDNS stack in
+   `connectedhomeip/src/lib/dnssd/minimal_mdns/`. Binds port 5353 directly via lwIP
+   `UDPEndPoint::Bind()`. Only handles Matter service types (`_matter._tcp`,
+   `_matterc._udp`). This is the default when `CONFIG_USE_MINIMAL_MDNS=y`.
+
+2. **ESP-IDF mDNS** — the `espressif__mdns` component. Uses `mdns_init()`, `mdns_query_ptr()`,
+   `mdns_service_add()`, etc. CHIP wraps this in `ESP32DnssdImpl.cpp` → `EspDnssdInit()`.
+   Used when `CONFIG_USE_MINIMAL_MDNS` is **not** set.
+
+When `CONFIG_USE_MINIMAL_MDNS=y` (the default), WLED discovery via `mdns_query_ptr()`
+fails because:
+- CHIP's minimal mDNS binds port 5353 and handles Matter traffic only
+- Our `wledDiscoveryInit()` creates a *separate* ESP-IDF mDNS instance that also binds 5353
+- Even with `CONFIG_LWIP_SO_REUSE=y` and `CONFIG_LWIP_SO_REUSE_RXTOALL=y`, the ESP-IDF
+  mDNS PCB never properly initialises — `mdns_query_ptr()` silently returns 0 results
+  because `mdsn_priv_pcb_is_inited()` returns false (the PCB state gate in
+  `mdns_querier.c:384` discards queries without error or logging)
+
+**Fix**: Set `CONFIG_USE_MINIMAL_MDNS` to `n` in `sdkconfig.defaults`. Now CHIP uses
+`EspDnssdInit()` which calls the ESP-IDF `mdns_init()`, creating a single shared mDNS
+stack. Both Matter advertising (`_matter._tcp`, `_matterc._udp`) and WLED discovery
+(`_http._tcp` PTR queries) go through the same ESP-IDF mDNS service.
+
+Additional hardening in `wledDiscoveryInit()`:
+- Calls `mdns_netif_action(sta, MDNS_EVENT_ENABLE_IP4)` to force the STA PCB to be
+  enabled for IPv4, handling edge cases where WiFi reconnect left it in PCB_OFF state
+- `wledDiscover()` has retry logic (up to 3 attempts with 2s delays) in case the PCB
+  is still in the probing phase when the first query fires
+
+The shared mDNS approach also saves ~24KB of flash by not linking the minimal mDNS code.
 
 ### WiFi AP mode fighting
 
@@ -528,7 +563,7 @@ in dual-framework mode.
 ### 7. mDNS port conflict
 
 **Cause:** `ArduinoOTA.begin()` calls `MDNS.begin()` which binds UDP 5353, conflicting
-with CHIP's minimal mDNS.
+with the mDNS service used by CHIP.
 
 **Fix:** `ArduinoOTA.setMdnsEnabled(false)`.
 
@@ -539,14 +574,24 @@ and connectivity checks break.
 
 **Fix:** Replace all Arduino WiFi state queries with `esp_netif` direct queries.
 
-### 9. Error 0x87 on Level Control
+### 9. mDNS WLED discovery returns 0 results
+
+**Cause:** `CONFIG_USE_MINIMAL_MDNS=y` (the default) makes CHIP use its own minimal mDNS
+on port 5353. Our `mdns_query_ptr()` uses the separate ESP-IDF mDNS stack which never
+properly initialises its PCB — queries are silently discarded.
+
+**Fix:** Set `CONFIG_USE_MINIMAL_MDNS` to `n` so CHIP uses the ESP-IDF mDNS service.
+Both Matter advertising and WLED discovery now share one mDNS stack. Added
+`mdns_netif_action(ENABLE_IP4)` safety net and query retry logic.
+
+### 10. Error 0x87 on Level Control
 
 **Cause:** `syncToMatter()` set `current_level` to 0 when light is off. Level Control
 minimum is 1.
 
 **Fix:** Only update level when on and brightness > 0.
 
-### 10. SCons `NodeList` crash
+### 11. SCons `NodeList` crash
 
 **Cause:** Dual-framework builds sometimes return `NodeList` instead of `Node` from
 `CollectBuildFiles`.
@@ -563,7 +608,7 @@ minimum is 1.
 |------|---------|
 | `platformio.ini` | Board, framework, dependencies, build flags (3 envs: esp32s3, esp32s3_16mb, esp32) |
 | `CMakeLists.txt` | IDF component build, C++20 downgrade |
-| `sdkconfig.defaults` | FreeRTOS HZ, Arduino autostart, mbedtls HKDF |
+| `sdkconfig.defaults` | FreeRTOS HZ, Arduino autostart, mbedtls HKDF, shared mDNS (`USE_MINIMAL_MDNS=n`) |
 | `idf_component.yml` | ESP-IDF component manifest (esp_matter dependency) |
 | `partitions/matter_wled_8MB.csv` | 8MB flash layout (default — used by esp32s3 and esp32) |
 | `partitions/matter_wled_16MB.csv` | 16MB flash layout (used by esp32s3_16mb) |

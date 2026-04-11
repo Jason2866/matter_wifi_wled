@@ -948,6 +948,15 @@ void webLoop() {
 }
 
 void webOnWifiConnected() {
-  // Start Matter stack once WiFi is up
+  // Start Matter stack once WiFi is up — Matter's EspDnssdInit() calls
+  // mdns_init() internally, creating the shared ESP-IDF mDNS service.
+  // (CONFIG_USE_MINIMAL_MDNS=n ensures CHIP uses the ESP-IDF mDNS stack
+  // instead of its own "minimal mDNS", so both Matter advertising and
+  // our WLED discovery share the same mDNS service.)
   matterOnWifiConnected();
+
+  // Initialize mDNS for WLED discovery — since Matter already called
+  // mdns_init(), this is a no-op for init but ensures our internal
+  // ready flag is set and forces the STA PCB to be enabled for IPv4.
+  wledDiscoveryInit();
 }

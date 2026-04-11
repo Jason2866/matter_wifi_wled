@@ -20,5 +20,11 @@ CONFIG_COMPILER_STACK_CHECK_MODE_STRONG=y
 # Matter (CHIP SDK) CHIPCryptoPALmbedTLS requires mbedtls_hkdf
 CONFIG_MBEDTLS_HKDF_C=y
 
+# Use the ESP-IDF mDNS library instead of CHIP's built-in "minimal mDNS".
+# This gives us a shared mDNS stack so that both Matter commissioning
+# advertising and WLED device discovery (mdns_query_ptr) work through
+# the same ESP-IDF mDNS service.
+# CONFIG_USE_MINIMAL_MDNS is not set
+
 # Flash size is set per-board in platformio.ini
 # (8MB for default targets, 16MB for N16R8 variant)

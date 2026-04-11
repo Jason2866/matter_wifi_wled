@@ -96,6 +96,7 @@ The firmware uses PlatformIO's **dual framework mode** (`arduino` + `espidf`). A
 ### Key Build Decisions
 
 - **No BLE** — `CONFIG_BT_ENABLED` is not set. WiFi-only commissioning avoids the BT controller crash that occurs with precompiled Arduino framework libs.
+- **Shared mDNS stack** — `CONFIG_USE_MINIMAL_MDNS` is disabled so CHIP uses the ESP-IDF mDNS service instead of its own "minimal mDNS". This allows both Matter commissioning advertising and WLED device discovery (`mdns_query_ptr`) to share a single mDNS stack.
 - **C++20 downgrade** — The Matter SDK's `TypeTraits.h` has broken C++23 syntax. CMakeLists.txt downgrades from `gnu++2b` to `gnu++20`.
 - **Native HTTP client** — Uses ESP-IDF's `esp_http_client` instead of Arduino's `HTTPClient` to avoid `ssl_client` linker errors in dual-framework mode.
 - **esp_netif for WiFi state** — After Matter starts, Arduino's `WiFi.status()` reports disconnected (state 254) even when connected. All WiFi state queries use `esp_netif` directly.

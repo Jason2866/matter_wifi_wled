@@ -23,8 +23,16 @@ struct WledDeviceInfo {
 };
 
 /**
+ * Initialize the mDNS subsystem for WLED discovery.
+ * Must be called once after WiFi is connected (before or after Matter starts).
+ * Safe to call multiple times — subsequent calls are no-ops.
+ */
+void wledDiscoveryInit();
+
+/**
  * Scan the local network for WLED devices via mDNS.
  * Queries each discovered device's /json/info for metadata.
+ * wledDiscoveryInit() must have been called first.
  *
  * @param results  Vector to fill with discovered devices
  * @param timeoutMs  mDNS scan timeout in milliseconds (default 5000)
