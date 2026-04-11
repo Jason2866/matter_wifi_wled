@@ -1,0 +1,14 @@
+## ESP-IDF Component Manager manifest for the Matter (Project CHIP) component.
+##
+## This file is copied to src/ by setup_matter_component.py during builds.
+##
+## Component registry: https://components.espressif.com/components/espressif/esp_matter
+
+dependencies:
+  ## ESP-IDF minimum version required by esp_matter
+  idf:
+    version: ">=5.1.0"
+
+  ## Matter (Project CHIP) component — provides esp_matter.h and all CHIP SDK headers
+  espressif/esp_matter:
+    version: ">=1.3.0"

@@ -1,0 +1,19 @@
+# PlatformIO build artifacts
+.pio/
+
+# Generated idf_component.yml in src/
+src/idf_component.yml
+
+# ESP-IDF Component Manager downloaded components
+managed_components/
+dependencies.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
