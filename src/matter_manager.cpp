@@ -1,19 +1,21 @@
 /*
  * Matter WiFi WLED Bridge - Matter Manager Implementation
  *
- * Manages the Matter (Project CHIP) stack, creating one Extended Color Light
- * endpoint per configured WLED device. Receives on/off, brightness, and
- * color commands from Matter controllers (Apple Home, Google Home, Alexa)
+ * Manages the Matter (Project CHIP) stack using a **Bridge architecture**:
+ *   - Root node  (endpoint 0)   — basic device information
+ *   - Aggregator (endpoint 1)   — bridge container (device type 0x000E)
+ *   - Bridged nodes (endpoints 2+) — one per WLED device (device type 0x0013)
+ *     each composited with Extended Color Light (device type 0x010D)
+ *
+ * Each bridged node has its own bridged_device_basic_information cluster
+ * carrying a unique node_label so controllers (Google Home, Apple Home,
+ * Alexa) display individual device names instead of a single "WLED Bridge".
+ *
+ * Receives on/off, brightness, and color commands from Matter controllers
  * and stores them in LightState structs for the WLED output module to consume.
  *
  * Based on the Matter over WiFi usermod from:
  * https://github.com/netmindz/WLED-MM/tree/matter-over-wifi/usermods/matter_over_wifi/
- *
- * Key differences from the WLED usermod version:
- * - Standalone (no WLED firmware dependencies)
- * - Multiple Matter endpoints (one per configured WLED device)
- * - Output goes to WLED devices via HTTP JSON API
- * - Each light has independent RGB state
  */
 
 #include "matter_manager.h"
@@ -29,6 +31,7 @@
 static constexpr uint32_t MATTER_CL_ON_OFF       = 0x0006;
 static constexpr uint32_t MATTER_CL_LEVEL_CTRL   = 0x0008;
 static constexpr uint32_t MATTER_CL_COLOR_CTRL   = 0x0300;
+static constexpr uint32_t MATTER_CL_BDBI         = 0x0039; // Bridged Device Basic Information
 
 // ── Matter attribute IDs ────────────────────────────────────────────────────
 // On/Off cluster
@@ -48,6 +51,7 @@ static constexpr uint8_t MATTER_CM_TEMP = 2; // Color Temperature
 
 // ── Module state ────────────────────────────────────────────────────────────
 static esp_matter::node_t *mNode = nullptr;
+static esp_matter::endpoint_t *mAggregator = nullptr; // Bridge aggregator endpoint
 static bool mStarted     = false;   // true after esp_matter::start() succeeds
 static bool mNodeReady   = false;   // true after node+endpoints created in setup
 static bool mSuppressed  = false;   // true when no lights configured
@@ -469,6 +473,7 @@ static void doMatterFactoryReset() {
   static const char * const kNamespaces[] = {
     "chip-config",
     "chip-counters",
+    "chip-factory",
     "CHIP_KVS",
     "esp_matter_kvs",
     "node",
@@ -547,8 +552,44 @@ void matterSetup() {
     return;
   }
 
-  // Create one Extended Color Light endpoint per configured light
+  // ── Bridge architecture ──────────────────────────────────────────────────
+  // 1. Create an Aggregator endpoint (device type 0x000E) to serve as the
+  //    bridge container. All bridged nodes become children of this endpoint.
+  esp_matter::endpoint::aggregator::config_t aggCfg;
+  mAggregator = esp_matter::endpoint::aggregator::create(
+      mNode, &aggCfg, esp_matter::ENDPOINT_FLAG_NONE, nullptr);
+  if (!mAggregator) {
+    ESP_LOGE("Matter", "Aggregator endpoint creation failed");
+    return;
+  }
+  uint16_t aggId = esp_matter::endpoint::get_id(mAggregator);
+  ESP_LOGI("Matter", "Aggregator endpoint created (id=%d)", aggId);
+
+  // 2. For each configured light, create a Bridged Node endpoint (device type
+  //    0x0013) with an Extended Color Light composited on top.  Each bridged
+  //    node carries its own bridged_device_basic_information cluster with a
+  //    unique node_label — this is what gives each device its own name in
+  //    Google Home, Apple Home, and Alexa.
   for (uint8_t i = 0; i < count; i++) {
+    const LightConfig &cfg = configStore.getLight(i);
+
+    // 2a. Create bridged_node endpoint (automatically gets ENDPOINT_FLAG_DESTROYABLE)
+    esp_matter::endpoint::bridged_node::config_t bridgedCfg;
+    bridgedCfg.bridged_device_basic_information.reachable = true;
+
+    esp_matter::endpoint_t *ep = esp_matter::endpoint::bridged_node::create(
+        mNode, &bridgedCfg,
+        esp_matter::ENDPOINT_FLAG_BRIDGE,
+        nullptr);
+    if (!ep) {
+      ESP_LOGE("Matter", "Bridged node %d creation failed", i);
+      continue;
+    }
+
+    // 2b. Set the aggregator as parent so the parts_list is populated correctly
+    esp_matter::endpoint::set_parent_endpoint(ep, mAggregator);
+
+    // 2c. Composite the Extended Color Light device type onto the bridged node
     esp_matter::endpoint::extended_color_light::config_t lightCfg;
     lightCfg.on_off.on_off                     = true;
     lightCfg.level_control.current_level       = 254;
@@ -557,20 +598,15 @@ void matterSetup() {
     lightCfg.color_control.hue_saturation.current_hue        = 0;
     lightCfg.color_control.hue_saturation.current_saturation = 0;
 
-    endpoints[i].endpoint = esp_matter::endpoint::extended_color_light::create(
-        mNode, &lightCfg, esp_matter::endpoint_flags::ENDPOINT_FLAG_NONE, nullptr);
-
-    if (!endpoints[i].endpoint) {
-      ESP_LOGE("Matter", "Endpoint %d creation failed", i);
+    esp_err_t err = esp_matter::endpoint::extended_color_light::add(ep, &lightCfg);
+    if (err != ESP_OK) {
+      ESP_LOGE("Matter", "Failed to add extended_color_light to bridged node %d (0x%x)", i, err);
       continue;
     }
 
-    endpoints[i].endpointId = esp_matter::endpoint::get_id(endpoints[i].endpoint);
-
-    // Add hue_saturation feature explicitly so color_capabilities gets
-    // bit 0x01 set and controllers expose RGB colour controls.
-    esp_matter::cluster_t *cc = esp_matter::cluster::get(
-        endpoints[i].endpoint, MATTER_CL_COLOR_CTRL);
+    // 2d. Add hue_saturation feature so color_capabilities bit 0x01 is set
+    //     and controllers expose RGB colour controls.
+    esp_matter::cluster_t *cc = esp_matter::cluster::get(ep, MATTER_CL_COLOR_CTRL);
     if (cc) {
       esp_matter::cluster::color_control::feature::hue_saturation::config_t hsCfg;
       hsCfg.current_hue        = 0;
@@ -578,8 +614,38 @@ void matterSetup() {
       esp_matter::cluster::color_control::feature::hue_saturation::add(cc, &hsCfg);
     }
 
-    ESP_LOGI("Matter", "Created endpoint %d (id=%d) for light '%s'",
-             i, endpoints[i].endpointId, configStore.getLight(i).name);
+    // 2e. Add per-endpoint name attributes to bridged_device_basic_information
+    //     cluster (0x0039). The cluster was created by bridged_node::create()
+    //     but only has feature_map, unique_id, cluster_revision, and reachable.
+    //     We must manually add node_label, product_name, and unique_id.
+    esp_matter::cluster_t *bdbi = esp_matter::cluster::get(ep, MATTER_CL_BDBI);
+    if (bdbi) {
+      // node_label — the primary display name controllers use
+      char label[33] = {};
+      strncpy(label, cfg.name, 32);
+      esp_matter::cluster::bridged_device_basic_information::attribute::create_node_label(
+          bdbi, label, strlen(label));
+
+      // product_name — secondary descriptor, e.g. "WLED Light"
+      char prodName[] = "WLED Light";
+      esp_matter::cluster::bridged_device_basic_information::attribute::create_product_name(
+          bdbi, prodName, strlen(prodName));
+
+      // unique_id — must be unique per bridged device for controller dedup.
+      //             Use "wled-<index>-<name>" to be stable across reboots.
+      char uid[33] = {};
+      snprintf(uid, sizeof(uid), "wled-%d-%.24s", i, cfg.name);
+      esp_matter::cluster::bridged_device_basic_information::attribute::create_unique_id(
+          bdbi, uid, strlen(uid));
+    } else {
+      ESP_LOGW("Matter", "Bridged node %d: bridged_device_basic_information cluster not found", i);
+    }
+
+    endpoints[i].endpoint = ep;
+    endpoints[i].endpointId = esp_matter::endpoint::get_id(ep);
+
+    ESP_LOGI("Matter", "Created bridged endpoint %d (id=%d) for light '%s'",
+             i, endpoints[i].endpointId, cfg.name);
   }
 
   mNodeReady = true;

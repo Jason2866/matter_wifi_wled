@@ -1,8 +1,10 @@
 /*
  * Matter WiFi WLED Bridge - Matter Manager
  *
- * Manages the Matter (Project CHIP) stack, exposing each configured WLED
- * device as a Matter Extended Color Light endpoint.
+ * Manages the Matter (Project CHIP) stack using a Bridge architecture.
+ * An Aggregator endpoint holds Bridged Node endpoints, each composited
+ * with Extended Color Light — giving each WLED device its own name in
+ * Google Home, Apple Home, and Alexa.
  *
  * Uses WiFi-only on-network commissioning (no BLE required).
  * Compatible with Apple Home, Google Home, and Amazon Alexa.
