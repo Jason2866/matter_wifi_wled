@@ -2,9 +2,9 @@
  * Matter WiFi WLED Bridge - WLED Device Discovery
  *
  * Discovers WLED devices on the local network using mDNS.
- * WLED devices advertise as _http._tcp with hostname typically "wled-XXXXXX".
- * After mDNS discovery, queries each device's /json/info endpoint to get
- * device name, LED count, RGBW capability, MAC address, etc.
+ * WLED devices advertise as _wled._tcp with a TXT record containing
+ * the MAC address. After mDNS discovery, queries each device's
+ * /json/info endpoint to get device name, LED count, RGBW capability, etc.
  */
 
 #pragma once
@@ -15,6 +15,7 @@
 struct WledDeviceInfo {
   char name[64];       // WLED device name (from /json/info)
   char host[64];       // IP address as string
+  char hostname[64];   // mDNS hostname (e.g. "wled-abcdef.local")
   uint16_t port;       // HTTP port (usually 80)
   char mac[18];        // MAC address (from /json/info)
   uint16_t ledCount;   // Number of LEDs
@@ -38,4 +39,4 @@ void wledDiscoveryInit();
  * @param timeoutMs  mDNS scan timeout in milliseconds (default 5000)
  * @return Number of devices found
  */
-int wledDiscover(std::vector<WledDeviceInfo>& results, uint32_t timeoutMs = 5000);
+int wledDiscover(std::vector<WledDeviceInfo>& results, uint32_t timeoutMs = 8000);

@@ -429,12 +429,13 @@ async function discoverWled() {
     if (devices.length === 0) {
       results.innerHTML = '<div class="discover-status">No WLED devices found. Make sure they are on the same network.</div>';
     } else {
-      results.innerHTML = devices.map((d, i) =>
-        `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(d.host)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
+      results.innerHTML = devices.map((d, i) => {
+        const preferHost = d.hostname || d.host;
+        return `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(preferHost)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
           <div class="dev-name">${escHtml(d.name)}</div>
-          <div class="dev-detail">${escHtml(d.host)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
-        </div>`
-      ).join('');
+          <div class="dev-detail">${escHtml(d.hostname || '')}${d.hostname ? ' (' + escHtml(d.host) + ')' : escHtml(d.host)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
+        </div>`;
+      }).join('');
     }
   } catch(e) {
     results.innerHTML = '<div class="discover-status" style="color:#e74c3c">Discovery failed: ' + escHtml(e.message) + '</div>';
@@ -709,6 +710,7 @@ static void setupRoutes() {
       JsonObject obj = arr.add<JsonObject>();
       obj["name"] = dev.name;
       obj["host"] = dev.host;
+      obj["hostname"] = dev.hostname;
       obj["port"] = dev.port;
       obj["mac"] = dev.mac;
       obj["ledCount"] = dev.ledCount;

@@ -2,8 +2,8 @@
  * Matter WiFi WLED Bridge - WLED Device Discovery Implementation
  *
  * Uses ESP-IDF's native mDNS API (mdns_query_ptr) to find WLED devices
- * on the network, then queries each device's /json/info endpoint for
- * detailed information.
+ * on the network via the _wled._tcp service type, then queries each
+ * device's /json/info endpoint for detailed information.
  *
  * Architecture:
  *   - wledDiscoveryInit() is called once after WiFi connects. It calls
@@ -12,11 +12,11 @@
  *     with MDNS_EVENT_ENABLE_IP4 to force the STA PCB to be enabled —
  *     this is necessary because Matter's WiFi takeover can cause a brief
  *     disconnect that leaves the mDNS PCB in PCB_OFF state.
- *   - wledDiscover() issues a PTR query with retry logic in case the PCB
- *     is still probing when the first query fires.
+ *   - wledDiscover() issues a PTR query for _wled._tcp with retry logic
+ *     in case the PCB is still probing when the first query fires.
  *
- * WLED devices advertise as _http._tcp. We identify them by checking
- * if the hostname starts with "wled" or by querying the /json/info endpoint.
+ * WLED devices advertise as _wled._tcp (dedicated service type) with a
+ * TXT record containing the MAC address.
  *
  * Uses ESP-IDF's esp_http_client (native, no Arduino SSL dependency).
  */
@@ -32,11 +32,13 @@
 
 static const char* TAG = "Discovery";
 
-// HTTP timeout for querying WLED device info
-static const int DISCOVERY_HTTP_TIMEOUT_MS = 10000;
+// HTTP timeout for querying WLED device info (needs to be long enough for
+// slow devices like HD panels with 4096+ LEDs, but short enough for good UX)
+static const int DISCOVERY_HTTP_TIMEOUT_MS = 5000;
 
-// Buffer for HTTP response body (WLED /json/info is typically ~400-800 bytes)
-static const int RESPONSE_BUF_SIZE = 2048;
+// Buffer for HTTP response body (WLED /json/info can be large on WLED-MM
+// devices with matrix configs — typically 400-2000 bytes, up to ~4KB)
+static const int RESPONSE_BUF_SIZE = 4096;
 
 // Track whether we've initialised mDNS from this module
 static bool sMdnsReady = false;
@@ -219,89 +221,103 @@ int wledDiscover(std::vector<WledDeviceInfo>& results, uint32_t timeoutMs) {
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 
-  ESP_LOGI(TAG, "Scanning for WLED devices via mDNS (IDF native)...");
+  ESP_LOGI(TAG, "Scanning for WLED devices via mDNS (_wled._tcp)...");
 
-  // Query for _http._tcp services using IDF's native mDNS API.
-  // Retry up to 2 times if we get 0 results — the mDNS PCB may still be
-  // probing/announcing after a WiFi reconnect or Matter restart, and queries
-  // silently return nothing until the PCB reaches PCB_RUNNING state.
-  uint32_t queryTimeout = (timeoutMs >= 3000) ? timeoutMs : 5000;
-  mdns_result_t* mdnsResults = NULL;
+  // Run multiple mDNS query passes and merge results. Low-power devices
+  // (especially ESP8266-based WLED) may not respond to every mDNS query,
+  // so a single pass often misses some. We run up to 3 passes with 4s each
+  // and de-duplicate by hostname.
+  static const int NUM_PASSES = 3;
+  static const uint32_t PASS_TIMEOUT_MS = 4000;
 
-  static const int MAX_RETRIES = 2;
-  for (int attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    if (attempt > 0) {
-      ESP_LOGI(TAG, "Retry %d/%d — waiting for mDNS PCB to become ready...", attempt, MAX_RETRIES);
-      vTaskDelay(pdMS_TO_TICKS(2000));
+  // Collect unique hostnames -> (ip, port) across all passes
+  struct MdnsDevice {
+    char hostname[64];
+    char hostLocal[80];
+    char ip[64];
+    uint16_t port;
+  };
+  static const int MAX_DEVICES = 20;
+  MdnsDevice found[MAX_DEVICES];
+  int foundCount = 0;
+
+  for (int pass = 0; pass < NUM_PASSES; pass++) {
+    if (pass > 0) {
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    ESP_LOGI(TAG, "mDNS query attempt %d, timeout: %lu ms", attempt + 1, (unsigned long)queryTimeout);
+    ESP_LOGI(TAG, "mDNS query pass %d/%d, timeout: %lu ms", pass + 1, NUM_PASSES, (unsigned long)PASS_TIMEOUT_MS);
 
-    esp_err_t err = mdns_query_ptr("_http", "_tcp", queryTimeout, 20, &mdnsResults);
+    mdns_result_t* mdnsResults = NULL;
+    esp_err_t err = mdns_query_ptr("_wled", "_tcp", PASS_TIMEOUT_MS, 20, &mdnsResults);
     if (err != ESP_OK) {
       ESP_LOGW(TAG, "mDNS query failed: %s", esp_err_to_name(err));
       continue;
     }
 
-    if (mdnsResults) {
-      break;  // Got results, proceed to processing
+    if (!mdnsResults) {
+      ESP_LOGI(TAG, "mDNS pass %d found 0 WLED services", pass + 1);
+      continue;
     }
-    ESP_LOGI(TAG, "mDNS found 0 HTTP services on attempt %d", attempt + 1);
+
+    // Merge new results into found[]
+    for (mdns_result_t* r = mdnsResults; r; r = r->next) {
+      const char* hostname = r->hostname;
+      if (!hostname) continue;
+
+      // Check for duplicate
+      bool dup = false;
+      for (int j = 0; j < foundCount; j++) {
+        if (strcasecmp(found[j].hostname, hostname) == 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup || foundCount >= MAX_DEVICES) continue;
+
+      // Get IP address
+      char ipStr[64];
+      if (!mdnsResultToIP(r, ipStr, sizeof(ipStr))) continue;
+
+      MdnsDevice& d = found[foundCount];
+      strlcpy(d.hostname, hostname, sizeof(d.hostname));
+      snprintf(d.hostLocal, sizeof(d.hostLocal), "%s.local", hostname);
+      strlcpy(d.ip, ipStr, sizeof(d.ip));
+      d.port = r->port;
+      foundCount++;
+
+      ESP_LOGI(TAG, "Pass %d: found WLED device: %s (%s:%d)", pass + 1, hostname, ipStr, d.port);
+    }
+
+    mdns_query_results_free(mdnsResults);
   }
 
-  if (!mdnsResults) {
-    ESP_LOGI(TAG, "mDNS found 0 HTTP services after all attempts");
+  ESP_LOGI(TAG, "mDNS found %d unique WLED devices across %d passes", foundCount, NUM_PASSES);
+
+  if (foundCount == 0) {
     return 0;
   }
 
-  // Count results for logging
-  int numServices = 0;
-  for (mdns_result_t* r = mdnsResults; r; r = r->next) {
-    numServices++;
-  }
-  ESP_LOGI(TAG, "mDNS found %d HTTP services", numServices);
+  // Query each unique device for its WLED info
+  for (int i = 0; i < foundCount; i++) {
+    const MdnsDevice& d = found[i];
 
-  // Iterate through results
-  for (mdns_result_t* r = mdnsResults; r; r = r->next) {
-    const char* hostname = r->hostname;
-    if (!hostname) continue;
-
-    // Filter for likely WLED devices by hostname
-    // WLED hostnames typically start with "wled" (case-insensitive)
-    bool likelyWled = (strncasecmp(hostname, "wled", 4) == 0);
-
-    if (!likelyWled) {
-      // Skip non-WLED devices to avoid slow HTTP timeouts
-      ESP_LOGD(TAG, "Skipping non-WLED service: %s", hostname);
-      continue;
-    }
-
-    // Get IP address string
-    char ipStr[64];
-    if (!mdnsResultToIP(r, ipStr, sizeof(ipStr))) {
-      ESP_LOGW(TAG, "No IP address for %s, skipping", hostname);
-      continue;
-    }
-
-    uint16_t port = r->port;
-
-    ESP_LOGI(TAG, "Checking device: %s (%s:%d)", hostname, ipStr, port);
+    ESP_LOGI(TAG, "Checking device: %s (%s / %s:%d)", d.hostname, d.hostLocal, d.ip, d.port);
 
     WledDeviceInfo info = {};
-    strlcpy(info.host, ipStr, sizeof(info.host));
-    info.port = port;
+    strlcpy(info.host, d.ip, sizeof(info.host));
+    strlcpy(info.hostname, d.hostLocal, sizeof(info.hostname));
+    info.port = d.port;
 
-    if (queryWledInfo(ipStr, port, info)) {
-      ESP_LOGI(TAG, "Found WLED device: %s (%s) - %d LEDs, RGBW=%d, v%s",
-               info.name, info.host, info.ledCount, info.isRGBW, info.version);
+    // Query using IP for speed (already resolved via mDNS)
+    if (queryWledInfo(d.ip, d.port, info)) {
+      ESP_LOGI(TAG, "Found WLED device: %s (%s / %s) - %d LEDs, RGBW=%d, v%s",
+               info.name, info.hostname, info.host, info.ledCount, info.isRGBW, info.version);
       results.push_back(info);
     } else {
-      ESP_LOGD(TAG, "Device %s is not a WLED device or not responding", hostname);
+      ESP_LOGD(TAG, "Device %s is not a WLED device or not responding", d.hostname);
     }
   }
-
-  // Free mDNS results
-  mdns_query_results_free(mdnsResults);
 
   ESP_LOGI(TAG, "Discovery complete: found %d WLED device(s)", (int)results.size());
   return results.size();
