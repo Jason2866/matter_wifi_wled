@@ -29,6 +29,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "wled: tests that also query WLED devices directly")
     config.addinivalue_line("markers", "matter: tests that require chip-tool (skipped if unavailable)")
     config.addinivalue_line("markers", "destructive: tests that modify device config (require --run-destructive)")
+    config.addinivalue_line("markers", "sse: tests for the Server-Sent Events endpoint")
 
 
 def pytest_addoption(parser):

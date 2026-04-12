@@ -10,14 +10,15 @@ Intended as a reference for future development, debugging, and porting work.
 1. [Project Overview](#project-overview)
 2. [Build System Architecture](#build-system-architecture)
 3. [WiFi Conflict Between Arduino and Matter](#wifi-conflict-between-arduino-and-matter)
-4. [Matter Color Control](#matter-color-control)
-5. [Color Sync and Feedback Loop](#color-sync-and-feedback-loop)
-6. [Device Naming in Matter](#device-naming-in-matter)
-7. [NVS Layout and Factory Reset](#nvs-layout-and-factory-reset)
-8. [Commissioning Credentials](#commissioning-credentials)
-9. [Known Constraints and Limits](#known-constraints-and-limits)
-10. [Crash History and Fixes](#crash-history-and-fixes)
-11. [Key File Locations](#key-file-locations)
+4. [Server-Sent Events (SSE) and esp_http_server](#server-sent-events-sse-and-esp_http_server)
+5. [Matter Color Control](#matter-color-control)
+6. [Color Sync and Feedback Loop](#color-sync-and-feedback-loop)
+7. [Device Naming in Matter](#device-naming-in-matter)
+8. [NVS Layout and Factory Reset](#nvs-layout-and-factory-reset)
+9. [Commissioning Credentials](#commissioning-credentials)
+10. [Known Constraints and Limits](#known-constraints-and-limits)
+11. [Crash History and Fixes](#crash-history-and-fixes)
+12. [Key File Locations](#key-file-locations)
 
 ---
 
@@ -210,6 +211,130 @@ The shared mDNS approach also saves ~24KB of flash by not linking the minimal mD
 `webSetup()` was starting in `WIFI_AP_STA` mode, causing WiFi mode toggling that confused
 Matter's WiFi driver. Fixed by using `WIFI_STA` only when saved WiFi credentials exist.
 AP mode is only used for initial WiFi configuration.
+
+---
+
+## Server-Sent Events (SSE) and esp_http_server
+
+### Motivation
+
+The original web UI used Arduino's `WebServer` library and JavaScript `setInterval()`
+polling on 2-second intervals to update status and light states. Each poll cycle issued
+two HTTP GET requests (`/api/status` + `/api/lights/state`), consuming WiFi radio time
+and adding latency to the UI.
+
+Migrating to ESP-IDF's native `esp_http_server` with Server-Sent Events (SSE) delivers
+two key improvements:
+1. **Instant UI updates** — state changes push to the browser in real-time instead of
+   waiting up to 2 seconds for the next poll cycle
+2. **Lower WiFi overhead** — a single persistent connection replaces continuous
+   request/response cycles
+
+### Why not ESPAsyncWebServer?
+
+`ESPAsyncWebServer` was the initial target for SSE support (it has built-in
+`AsyncEventSource`). However, it is fundamentally incompatible with the dual-framework
+build (`arduino + espidf`):
+
+- It depends on `AsyncTCP`, which uses raw lwIP `tcp_*` APIs and hardcodes timer
+  callback mechanisms that conflict with ESP-IDF's lwIP configuration
+- The `tcp_poll()` timer periods and `TCP_MSS` values differ between Arduino's precompiled
+  lwIP and our source-compiled ESP-IDF lwIP, causing crashes and memory corruption
+- No amount of build flag tweaking resolves this — the two lwIP stacks are incompatible
+
+`esp_http_server` is part of the same ESP-IDF we already compile from source, so it works
+perfectly in the dual-framework environment.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│ esp_http_server (own FreeRTOS task)                  │
+│  ├── GET /              → handleRoot()              │
+│  ├── GET /api/status    → handleStatus()            │
+│  ├── GET /api/config    → handleConfig()            │
+│  ├── POST /api/config   → handleConfigPost()        │
+│  ├── GET /api/lights/state → handleLightState()     │
+│  ├── GET /api/events    → handleEvents()  [SSE]     │
+│  ├── GET /api/wled/discover → handleWledDiscover()  │
+│  ├── POST /api/matter/reset → handleMatterReset()   │
+│  ├── POST /api/ota      → handleOta()               │
+│  └── GET /*             → handleCaptive() [wildcard]│
+└─────────────────────────────────────────────────────┘
+         ↑                          ↑
+    REST requests              SSE push events
+    (normal req/resp)          (from webLoop)
+```
+
+The HTTP server runs in its own FreeRTOS task, so `webLoop()` no longer needs to call
+`handleClient()`. Instead, `webLoop()` calls `ssePollAndPush()` which compares state
+snapshots and pushes events to the connected SSE client.
+
+### SSE event types
+
+| Event name | Payload | When sent |
+|-----------|---------|-----------|
+| `status` | Same JSON as `GET /api/status` | On connect; on WiFi/Matter state change |
+| `lightstate` | Same JSON as `GET /api/lights/state` | On connect; on any light state change |
+| `: keepalive` | (comment, no data) | Every ~15s if no events were sent |
+
+### SSE implementation details
+
+**Single client limit:** Only one SSE client is supported at a time (sufficient for a
+config UI). A new connection closes the previous one.
+
+**Async handoff:** The `handleEvents()` handler sends initial events via
+`httpd_resp_send_chunk()`, then calls `httpd_req_async_handler_begin()` to detach the
+request from the worker thread. The socket file descriptor is stored in `sseFd` for
+later direct writes via `httpd_socket_send()`.
+
+**Change detection:** `StatusSnapshot` and `LightSnapshot` structs capture current state
+each loop iteration. Field-by-field comparison (status) or `memcmp` (lights) detects
+changes without building JSON every cycle.
+
+**Session close callback:** `httpd_config_t.close_fn` is set to `sseSessionCloseCb()`.
+This fires for **every** session close (not just SSE), so it checks `sockfd == sseFd`.
+When `close_fn` is set, the server does **not** close the socket automatically — the
+callback must call `close(sockfd)` manually.
+
+**Keepalive:** An SSE comment (`: keepalive\n\n`) is sent every 15 seconds when no data
+events were pushed. This prevents TCP idle timeouts and allows early detection of dead
+connections.
+
+### Client-side implementation
+
+The frontend JavaScript uses `EventSource` with a polling fallback:
+
+```javascript
+function startSSE() {
+  evtSource = new EventSource('/api/events');
+  evtSource.addEventListener('status', (e) => applyStatus(JSON.parse(e.data)));
+  evtSource.addEventListener('lightstate', (e) => applyLightStates(JSON.parse(e.data)));
+  evtSource.onerror = () => {
+    if (evtSource.readyState === EventSource.CLOSED) {
+      // SSE permanently failed — fall back to polling
+      setInterval(pollStatus, 3000);
+      setInterval(pollLights, 3000);
+    }
+    // Otherwise EventSource auto-reconnects
+  };
+}
+```
+
+The `applyStatus()` and `applyLightStates()` functions are shared between SSE event
+handlers and the initial REST `fetch()` calls, so the same DOM update logic runs
+regardless of how the data arrives.
+
+### Key pitfall: blocking handler
+
+`esp_http_server` has a small worker thread pool (default 4). If an SSE handler blocks
+(e.g., sits in a `while(true)` loop sending events), it permanently occupies a worker
+thread. With enough SSE clients, all workers are blocked and the server stops processing
+REST requests.
+
+The solution is the async handoff: `handleEvents()` returns immediately after sending
+initial events. Subsequent pushes happen from `webLoop()` via raw socket writes, never
+tying up a worker thread.
 
 ---
 
@@ -676,7 +801,7 @@ minimum is 1.
 |------|---------|
 | `src/main.cpp` | Entry point, setup/loop, ArduinoOTA |
 | `src/matter_manager.cpp` | Matter stack: bridge topology (aggregator + bridged nodes), callbacks, pairing codes, NVS naming |
-| `src/web_ui.cpp` | Web server, REST API, WiFi manager, esp_netif helpers |
+| `src/web_ui.cpp` | esp_http_server, REST API, SSE event stream, WiFi manager, esp_netif helpers |
 | `src/config_store.cpp` | NVS persistence for light configuration |
 | `src/wled_discovery.cpp` | mDNS WLED device discovery |
 | `src/wled_output.cpp` | HTTP POST to WLED JSON API |

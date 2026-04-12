@@ -23,7 +23,7 @@ Apple Home / Google Home / Alexa
 - **Up to 16 WLED lights** — each exposed as an independent bridged endpoint
 - **Full color control** — hue/saturation, CIE XY, and color temperature (mireds)
 - **mDNS auto-discovery** — finds WLED devices on your network automatically
-- **Web configuration UI** — captive portal for WiFi setup, device management
+- **Web configuration UI** — captive portal for WiFi setup, device management, live updates via SSE
 - **WiFi-only commissioning** — no Bluetooth/BLE required
 - **OTA updates** — update firmware over the network via ArduinoOTA or web UI
 - **Factory reset** — Matter-only reset preserves WiFi credentials
@@ -77,7 +77,7 @@ Default pairing code: `34970112332` (test credentials — change before producti
 
 ## Architecture
 
-The firmware uses PlatformIO's **dual framework mode** (`arduino` + `espidf`). Arduino provides the web server, OTA, and WiFi management. ESP-IDF compiles the Matter SDK (`esp_matter`) from source via the IDF Component Manager, generating a proper sdkconfig with BLE disabled.
+The firmware uses PlatformIO's **dual framework mode** (`arduino` + `espidf`). Arduino provides OTA and WiFi management. ESP-IDF provides the HTTP server (`esp_http_server` with SSE for live UI updates), compiles the Matter SDK (`esp_matter`) from source via the IDF Component Manager, and generates a proper sdkconfig with BLE disabled.
 
 ### Matter Bridge Topology
 
@@ -101,7 +101,7 @@ Endpoint IDs are deterministic and stable across reboots. When a WLED device is 
 |------|---------|
 | `src/main.cpp` | Entry point, setup/loop, ArduinoOTA |
 | `src/matter_manager.cpp` | Matter stack: bridge topology, endpoints, attribute callbacks |
-| `src/web_ui.cpp` | Web server, REST API, captive portal, WiFi management |
+| `src/web_ui.cpp` | esp_http_server, REST API, SSE event stream, captive portal, WiFi management |
 | `src/config_store.cpp` | NVS persistence for light configuration |
 | `src/wled_discovery.cpp` | mDNS discovery of WLED devices on the network |
 | `src/wled_output.cpp` | HTTP POST to WLED `/json/state` API |
@@ -168,7 +168,7 @@ pip install pytest requests
 BRIDGE_IP=<device-ip> pytest tests/ -v
 ```
 
-Tests cover the REST API (status, config, light states), WLED mDNS discovery, web UI, config persistence, and bridge-to-WLED forwarding. Run `pytest tests/ --run-destructive` to include tests that modify device state (factory reset, config wipe).
+Tests cover the REST API (status, config, light states), SSE event stream, WLED mDNS discovery, web UI, config persistence, and bridge-to-WLED forwarding. Run `pytest tests/ --run-destructive` to include tests that modify device state (factory reset, config wipe).
 
 See [AGENTS.md](AGENTS.md#tests) for full test documentation.
 

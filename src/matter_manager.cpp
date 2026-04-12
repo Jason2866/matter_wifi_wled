@@ -41,6 +41,8 @@ static constexpr uint32_t MATTER_AT_CURRENT_LEVEL = 0x0000;
 // Color Control cluster
 static constexpr uint32_t MATTER_AT_CURRENT_HUE   = 0x0000;
 static constexpr uint32_t MATTER_AT_CURRENT_SAT   = 0x0001;
+static constexpr uint32_t MATTER_AT_CURRENT_X      = 0x0003;
+static constexpr uint32_t MATTER_AT_CURRENT_Y      = 0x0004;
 static constexpr uint32_t MATTER_AT_COLOR_TEMP     = 0x0007;
 static constexpr uint32_t MATTER_AT_COLOR_MODE     = 0x0008;
 
@@ -129,6 +131,9 @@ struct PendingState {
   volatile bool    hsDirty;
   volatile uint8_t hue;
   volatile uint8_t sat;
+  volatile bool    xyDirty;
+  volatile uint16_t colorX;
+  volatile uint16_t colorY;
   volatile bool    ctDirty;
   volatile uint16_t ct;
   volatile uint8_t colorMode;
@@ -252,6 +257,141 @@ static void mirekToRGB(uint16_t mirek, uint8_t &r, uint8_t &g, uint8_t &b) {
   }
 }
 
+// ── CIE 1931 XY <-> RGB conversions ────────────────────────────────────────
+
+// sRGB gamut triangle vertices in CIE 1931 xy
+static constexpr float SRGB_RX = 0.6400f, SRGB_RY = 0.3300f;
+static constexpr float SRGB_GX = 0.3000f, SRGB_GY = 0.6000f;
+static constexpr float SRGB_BX = 0.1500f, SRGB_BY = 0.0600f;
+static constexpr float D65_X   = 0.3127f, D65_Y   = 0.3290f;
+
+// 2D cross product: (a - o) x (b - o)
+static inline float cross2d(float ox, float oy,
+                             float ax, float ay,
+                             float bx, float by) {
+  return (ax - ox) * (by - oy) - (ay - oy) * (bx - ox);
+}
+
+// Test if point (px,py) is inside the sRGB gamut triangle
+static bool inSRGBGamut(float px, float py) {
+  float d1 = cross2d(px, py, SRGB_RX, SRGB_RY, SRGB_GX, SRGB_GY);
+  float d2 = cross2d(px, py, SRGB_GX, SRGB_GY, SRGB_BX, SRGB_BY);
+  float d3 = cross2d(px, py, SRGB_BX, SRGB_BY, SRGB_RX, SRGB_RY);
+  bool hasNeg = (d1 < 0) || (d2 < 0) || (d3 < 0);
+  bool hasPos = (d1 > 0) || (d2 > 0) || (d3 > 0);
+  return !(hasNeg && hasPos);
+}
+
+// Intersect ray (p1 -> p2) with line segment (p3, p4).
+// Returns parametric t along the ray, or -1 if no valid intersection.
+static float raySegIntersect(float x1, float y1, float x2, float y2,
+                              float x3, float y3, float x4, float y4) {
+  float denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4);
+  if (fabsf(denom) < 1e-10f) return -1.0f;
+  float t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / denom;
+  float u = -((x1 - x2) * (y1 - y3) - (y1 - y2) * (x1 - x3)) / denom;
+  return (u >= 0.0f && u <= 1.0f && t >= 0.0f) ? t : -1.0f;
+}
+
+// Map an out-of-gamut CIE xy point into the sRGB gamut by projecting from
+// D65 white through the target point onto the gamut boundary. This preserves
+// hue while clipping saturation — the standard approach for LED output.
+static void mapToSRGBGamut(float &x, float &y) {
+  if (inSRGBGamut(x, y)) return;
+
+  // Edges of the sRGB triangle: R-G, G-B, B-R
+  const float edges[][4] = {
+    {SRGB_RX, SRGB_RY, SRGB_GX, SRGB_GY},
+    {SRGB_GX, SRGB_GY, SRGB_BX, SRGB_BY},
+    {SRGB_BX, SRGB_BY, SRGB_RX, SRGB_RY},
+  };
+
+  float bestT = -1.0f;
+  float bestX = x, bestY = y;
+  for (int i = 0; i < 3; i++) {
+    float t = raySegIntersect(D65_X, D65_Y, x, y,
+                               edges[i][0], edges[i][1],
+                               edges[i][2], edges[i][3]);
+    if (t > 0.0f && t <= 1.0f && t > bestT) {
+      bestT = t;
+      bestX = D65_X + t * (x - D65_X);
+      bestY = D65_Y + t * (y - D65_Y);
+    }
+  }
+  x = bestX;
+  y = bestY;
+}
+
+static void xyToRGB(uint16_t zclX, uint16_t zclY,
+                    uint8_t &r, uint8_t &g, uint8_t &b) {
+  float x = static_cast<float>(zclX) / 65279.0f;
+  float y = static_cast<float>(zclY) / 65279.0f;
+  if (y < 0.001f) y = 0.001f;
+
+  // Map out-of-gamut xy into sRGB triangle (controllers may use wider gamuts)
+  mapToSRGBGamut(x, y);
+
+  float Y = 1.0f;
+  float X = (Y / y) * x;
+  float Z = (Y / y) * (1.0f - x - y);
+
+  float rf = X * 3.2404542f + Y * -1.5371385f + Z * -0.4985314f;
+  float gf = X * -0.9692660f + Y * 1.8760108f + Z * 0.0415560f;
+  float bf = X * 0.0556434f + Y * -0.2040259f + Z * 1.0572252f;
+
+  // Clamp negative channels to 0 (out-of-gamut handling)
+  if (rf < 0.0f) rf = 0.0f;
+  if (gf < 0.0f) gf = 0.0f;
+  if (bf < 0.0f) bf = 0.0f;
+
+  // Normalize so max channel = 1.0 BEFORE gamma — preserves channel ratios
+  // (clamping to [0,1] before gamma would destroy ratios for saturated colors)
+  float maxC = rf;
+  if (gf > maxC) maxC = gf;
+  if (bf > maxC) maxC = bf;
+  if (maxC > 0.001f) {
+    rf /= maxC; gf /= maxC; bf /= maxC;
+  }
+
+  auto reverseGamma = [](float v) -> float {
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f;
+  };
+  rf = reverseGamma(rf); gf = reverseGamma(gf); bf = reverseGamma(bf);
+
+  r = static_cast<uint8_t>(rf * 255.0f + 0.5f);
+  g = static_cast<uint8_t>(gf * 255.0f + 0.5f);
+  b = static_cast<uint8_t>(bf * 255.0f + 0.5f);
+}
+
+static void rgbToXY(uint8_t r, uint8_t g, uint8_t b,
+                    uint16_t &zclX, uint16_t &zclY) {
+  // Apply sRGB gamma to get linear values
+  auto applyGamma = [](float v) -> float {
+    v /= 255.0f;
+    return (v <= 0.04045f) ? v / 12.92f : powf((v + 0.055f) / 1.055f, 2.4f);
+  };
+  float rf = applyGamma(static_cast<float>(r));
+  float gf = applyGamma(static_cast<float>(g));
+  float bf = applyGamma(static_cast<float>(b));
+
+  // sRGB to CIE XYZ (D65)
+  float X = rf * 0.4124564f + gf * 0.3575761f + bf * 0.1804375f;
+  float Y = rf * 0.2126729f + gf * 0.7151522f + bf * 0.0721750f;
+  float Z = rf * 0.0193339f + gf * 0.1191920f + bf * 0.9503041f;
+
+  float sum = X + Y + Z;
+  if (sum < 0.0001f) {
+    // Black — use D65 white point
+    zclX = static_cast<uint16_t>(D65_X * 65279.0f + 0.5f);
+    zclY = static_cast<uint16_t>(D65_Y * 65279.0f + 0.5f);
+    return;
+  }
+  float cx = X / sum;
+  float cy = Y / sum;
+  zclX = static_cast<uint16_t>(cx * 65279.0f + 0.5f);
+  zclY = static_cast<uint16_t>(cy * 65279.0f + 0.5f);
+}
+
 // ── RGB to Matter hue/saturation ────────────────────────────────────────────
 static void rgbToMatterHS(uint8_t r, uint8_t g, uint8_t b,
                            uint8_t &matterHue, uint8_t &matterSat) {
@@ -306,6 +446,14 @@ static esp_err_t _attrCb(esp_matter::attribute::callback_type_t type,
         pendingStates[idx].sat     = val->val.u8;
         pendingStates[idx].hsDirty = true;
         break;
+      case MATTER_AT_CURRENT_X:
+        pendingStates[idx].colorX  = val->val.u16;
+        pendingStates[idx].xyDirty = true;
+        break;
+      case MATTER_AT_CURRENT_Y:
+        pendingStates[idx].colorY  = val->val.u16;
+        pendingStates[idx].xyDirty = true;
+        break;
       case MATTER_AT_COLOR_TEMP:
         pendingStates[idx].ct      = val->val.u16;
         pendingStates[idx].ctDirty = true;
@@ -343,13 +491,14 @@ static void applyPending() {
   for (uint8_t i = 0; i < count; i++) {
     PendingState &p = pendingStates[i];
 
-    bool anyChange = p.onDirty || p.briDirty || p.hsDirty || p.ctDirty;
+    bool anyChange = p.onDirty || p.briDirty || p.hsDirty || p.xyDirty || p.ctDirty;
     if (!anyChange) continue;
 
     // Snapshot and clear flags
     bool applyOn  = p.onDirty;  p.onDirty  = false;
     bool applyBri = p.briDirty; p.briDirty = false;
     bool applyHS  = p.hsDirty;  p.hsDirty  = false;
+    bool applyXY  = p.xyDirty;  p.xyDirty  = false;
     bool applyCT  = p.ctDirty;  p.ctDirty  = false;
 
     if (applyOn || applyBri) {
@@ -372,6 +521,20 @@ static void applyPending() {
       lightStates[i].green = g;
       lightStates[i].blue = b;
       lightStates[i].white = w;
+      uint16_t zclX, zclY;
+      rgbToXY(r, g, b, zclX, zclY);
+      lightStates[i].colorX = static_cast<float>(zclX) / 65279.0f;
+      lightStates[i].colorY = static_cast<float>(zclY) / 65279.0f;
+    } else if (applyXY && p.colorMode == MATTER_CM_XY) {
+      uint8_t r, g, b, w;
+      xyToRGB(p.colorX, p.colorY, r, g, b);
+      decomposeRGBW(i, r, g, b, w);
+      lightStates[i].red = r;
+      lightStates[i].green = g;
+      lightStates[i].blue = b;
+      lightStates[i].white = w;
+      lightStates[i].colorX = static_cast<float>(p.colorX) / 65279.0f;
+      lightStates[i].colorY = static_cast<float>(p.colorY) / 65279.0f;
     } else if (applyHS && p.colorMode != MATTER_CM_TEMP) {
       uint8_t r, g, b, w;
       hsvToRGB(p.hue, p.sat, r, g, b);
@@ -380,6 +543,10 @@ static void applyPending() {
       lightStates[i].green = g;
       lightStates[i].blue = b;
       lightStates[i].white = w;
+      uint16_t zclX, zclY;
+      rgbToXY(r, g, b, zclX, zclY);
+      lightStates[i].colorX = static_cast<float>(zclX) / 65279.0f;
+      lightStates[i].colorY = static_cast<float>(zclY) / 65279.0f;
     }
   }
 }
@@ -591,6 +758,8 @@ void matterSetup() {
     lightStates[i].green = g;
     lightStates[i].blue = b;
     lightStates[i].white = w;
+    lightStates[i].colorX = D65_X;
+    lightStates[i].colorY = D65_Y;
     lightStates[i].transitioning = false;
 
     memset(&pendingStates[i], 0, sizeof(PendingState));
@@ -696,14 +865,19 @@ void matterSetup() {
       continue;
     }
 
-    // 2d. Add hue_saturation feature so color_capabilities bit 0x01 is set
-    //     and controllers expose RGB colour controls.
+    // 2d. Add hue_saturation and xy features so color_capabilities bits are set
+    //     and controllers expose both HS and CIE xy colour controls.
     esp_matter::cluster_t *cc = esp_matter::cluster::get(ep, MATTER_CL_COLOR_CTRL);
     if (cc) {
       esp_matter::cluster::color_control::feature::hue_saturation::config_t hsCfg;
       hsCfg.current_hue        = 0;
       hsCfg.current_saturation = 0;
       esp_matter::cluster::color_control::feature::hue_saturation::add(cc, &hsCfg);
+
+      esp_matter::cluster::color_control::feature::xy::config_t xyCfg;
+      xyCfg.current_x = static_cast<uint16_t>(D65_X * 65279.0f + 0.5f);
+      xyCfg.current_y = static_cast<uint16_t>(D65_Y * 65279.0f + 0.5f);
+      esp_matter::cluster::color_control::feature::xy::add(cc, &xyCfg);
     }
 
     // 2e. Add per-endpoint name attributes to bridged_device_basic_information

@@ -14,6 +14,9 @@ import pytest
 import requests
 import time
 import json
+import threading
+import socket
+from urllib.parse import urlparse
 
 REQUEST_TIMEOUT = 10
 
@@ -173,6 +176,8 @@ class TestLightStates:
             assert "g" in state, f"State {i} missing 'g'"
             assert "b" in state, f"State {i} missing 'b'"
             assert "w" in state, f"State {i} missing 'w'"
+            assert "x" in state, f"State {i} missing 'x' (CIE xy)"
+            assert "y" in state, f"State {i} missing 'y' (CIE xy)"
 
     def test_endpoint_ids_are_valid(self, bridge_url):
         """Each light should have a Matter endpoint ID >= 2 (0=root, 1=aggregator)."""
@@ -195,6 +200,8 @@ class TestLightStates:
             assert 0 <= state["g"] <= 255, f"State {i}: 'g' out of range"
             assert 0 <= state["b"] <= 255, f"State {i}: 'b' out of range"
             assert 0 <= state["w"] <= 255, f"State {i}: 'w' out of range"
+            assert 0.0 <= state["x"] <= 1.0, f"State {i}: 'x' (CIE) out of range"
+            assert 0.0 <= state["y"] <= 1.0, f"State {i}: 'y' (CIE) out of range"
 
     def test_off_lights_have_zero_rgb(self, bridge_url):
         """When a light is off, its scaled RGB values should be 0."""
@@ -466,6 +473,255 @@ class TestBridgeToWledForwarding:
             # A full test would send a command via Matter and then check.
             assert isinstance(bridge_on, bool), f"Light {i}: bridge on state not bool"
             assert isinstance(wled_on, bool), f"Light {i}: WLED on state not bool"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Server-Sent Events (SSE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SSEClient:
+    """Lightweight SSE reader using a raw TCP socket.
+
+    Uses a raw socket instead of requests to handle the esp_http_server's
+    mixed chunked-then-raw-send pattern (initial events via chunked encoding,
+    subsequent events via httpd_socket_send).
+
+    Runs in a background thread, collecting events into a list.
+    Each event is a dict with 'event' and 'data' keys.
+    """
+
+    def __init__(self, url, timeout=10):
+        self.url = url
+        self.timeout = timeout
+        self.events = []
+        self.error = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._sock = None
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self):
+        self._stop.set()
+        # Close socket to unblock recv
+        if self._sock:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+        self._thread.join(timeout=5)
+
+    def wait_for_events(self, count, timeout=10):
+        """Block until at least `count` events are collected or timeout."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(self.events) >= count:
+                return True
+            if self.error:
+                return False
+            time.sleep(0.1)
+        return len(self.events) >= count
+
+    def _run(self):
+        try:
+            parsed = urlparse(self.url)
+            host = parsed.hostname
+            port = parsed.port or 80
+            path = parsed.path or "/"
+
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(self.timeout)
+            self._sock.connect((host, port))
+
+            # Send HTTP GET request
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                f"Accept: text/event-stream\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+            )
+            self._sock.sendall(req.encode())
+
+            # Read response — accumulate data and parse SSE lines
+            buf = ""
+            header_done = False
+            event_type = None
+            data_buf = []
+
+            while not self._stop.is_set():
+                try:
+                    chunk = self._sock.recv(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                if not chunk:
+                    break
+
+                buf += chunk.decode("utf-8", errors="replace")
+
+                # Skip HTTP headers on first read
+                if not header_done:
+                    hdr_end = buf.find("\r\n\r\n")
+                    if hdr_end == -1:
+                        continue
+                    buf = buf[hdr_end + 4:]
+                    header_done = True
+
+                # Parse SSE lines from buffer
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.rstrip("\r")
+
+                    # Handle chunked transfer-encoding hex size lines
+                    # (these are hex numbers like "1a3" on their own line)
+                    stripped = line.strip()
+                    if stripped and all(c in "0123456789abcdefABCDEF" for c in stripped):
+                        continue  # skip chunk size line
+
+                    if line == "":
+                        # Empty line = end of event
+                        if event_type and data_buf:
+                            self.events.append({
+                                "event": event_type,
+                                "data": "\n".join(data_buf),
+                            })
+                        event_type = None
+                        data_buf = []
+                    elif line.startswith("event: "):
+                        event_type = line[7:]
+                    elif line.startswith("data: "):
+                        data_buf.append(line[6:])
+                    elif line.startswith(":"):
+                        # SSE comment (e.g. keepalive)
+                        self.events.append({
+                            "event": ":comment",
+                            "data": line[1:].strip(),
+                        })
+        except Exception as e:
+            if not self._stop.is_set():
+                self.error = e
+        finally:
+            if self._sock:
+                try:
+                    self._sock.close()
+                except Exception:
+                    pass
+
+
+@pytest.mark.bridge
+@pytest.mark.sse
+class TestSSE:
+    """Tests for the Server-Sent Events endpoint GET /api/events."""
+
+    def test_sse_initial_events(self, bridge_url):
+        """Connecting to /api/events should immediately receive status and lightstate events."""
+        client = _SSEClient(f"{bridge_url}/api/events").start()
+        try:
+            assert client.wait_for_events(2, timeout=10), \
+                f"Expected 2 initial events, got {len(client.events)}: {client.events}"
+
+            event_types = [e["event"] for e in client.events[:2]]
+            assert "status" in event_types, f"Missing 'status' event in {event_types}"
+            assert "lightstate" in event_types, f"Missing 'lightstate' event in {event_types}"
+
+            # Validate status event is parseable JSON with expected fields
+            status_evt = next(e for e in client.events if e["event"] == "status")
+            status_data = json.loads(status_evt["data"])
+            assert "wifi" in status_data
+            assert "lightCount" in status_data
+
+            # Validate lightstate event is parseable JSON with expected fields
+            light_evt = next(e for e in client.events if e["event"] == "lightstate")
+            light_data = json.loads(light_evt["data"])
+            assert "lights" in light_data
+            assert isinstance(light_data["lights"], list)
+        finally:
+            client.stop()
+
+    def test_sse_concurrent_rest(self, bridge_url):
+        """REST API should still work while an SSE connection is active."""
+        client = _SSEClient(f"{bridge_url}/api/events").start()
+        try:
+            assert client.wait_for_events(2, timeout=10), \
+                "SSE connection failed to deliver initial events"
+
+            # Make several REST API calls while SSE is connected
+            r = requests.get(f"{bridge_url}/api/status", timeout=REQUEST_TIMEOUT)
+            assert r.status_code == 200
+            assert "wifi" in r.json()
+
+            r = requests.get(f"{bridge_url}/api/config", timeout=REQUEST_TIMEOUT)
+            assert r.status_code == 200
+            assert "lights" in r.json()
+
+            r = requests.get(f"{bridge_url}/api/lights/state", timeout=REQUEST_TIMEOUT)
+            assert r.status_code == 200
+            assert "lights" in r.json()
+        finally:
+            client.stop()
+
+    def test_sse_reconnect(self, bridge_url):
+        """A second SSE connection should replace the first and receive initial events."""
+        client1 = _SSEClient(f"{bridge_url}/api/events").start()
+        try:
+            assert client1.wait_for_events(2, timeout=10), \
+                "First SSE connection failed"
+        finally:
+            client1.stop()
+
+        time.sleep(0.5)
+
+        # Connect a second client — should get fresh initial events
+        client2 = _SSEClient(f"{bridge_url}/api/events").start()
+        try:
+            assert client2.wait_for_events(2, timeout=10), \
+                f"Second SSE connection failed, got {len(client2.events)} events"
+
+            event_types = [e["event"] for e in client2.events[:2]]
+            assert "status" in event_types
+            assert "lightstate" in event_types
+        finally:
+            client2.stop()
+
+    def test_sse_keepalive(self, bridge_url):
+        """SSE connection should remain alive, receiving keepalives or data events."""
+        client = _SSEClient(f"{bridge_url}/api/events", timeout=30).start()
+        try:
+            # Wait for initial events first
+            assert client.wait_for_events(2, timeout=10), \
+                "SSE connection failed to deliver initial events"
+
+            initial_count = len(client.events)
+
+            # Wait up to 20 seconds for any new event after the initial ones.
+            # This could be a keepalive comment (sent every ~15s when idle)
+            # or a data event (sent when light state changes).
+            # Either proves the SSE connection is alive and persistent.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if len(client.events) > initial_count:
+                    # Got a new event — connection is alive
+                    new_events = client.events[initial_count:]
+                    new_types = [e["event"] for e in new_events]
+                    # Verify we got a valid event type
+                    for evt_type in new_types:
+                        assert evt_type in (":comment", "status", "lightstate"), \
+                            f"Unexpected event type: {evt_type}"
+                    return  # success
+                if client.error:
+                    pytest.fail(f"SSE client errored: {client.error}")
+                time.sleep(0.5)
+
+            pytest.fail(
+                f"No new events received within 20s after initial events. "
+                f"Total events: {len(client.events)}"
+            )
+        finally:
+            client.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

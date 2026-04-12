@@ -11,6 +11,14 @@ Extended Color Light endpoint.
 
 The codebase is compact: 6 `.cpp` files + 5 `.h` headers in `src/` and `include/`.
 
+## Workflow Rules
+
+- **Always flash and test before commit.** Every change to firmware or test code must be
+  built (`pio run -e esp32s3`), flashed to the device (USB serial via `/dev/ttyACM0`),
+  and verified by running the integration test suite (`pytest tests/ -v`) against the
+  live device **before** creating a git commit. Do not commit code that has not been
+  validated on hardware.
+
 ## Build Commands
 
 ```bash
@@ -45,8 +53,9 @@ incremental builds are much faster.
 ## Tests
 
 Integration tests run against a **live device** over the network using pytest. They
-exercise the REST API, web UI, WLED discovery, config persistence, and bridge-to-WLED
-forwarding. There are no unit tests — the firmware has no test harness on-device.
+exercise the REST API, SSE event stream, web UI, WLED discovery, config persistence, and
+bridge-to-WLED forwarding. There are no unit tests — the firmware has no test harness
+on-device.
 
 ### Prerequisites
 
@@ -74,7 +83,7 @@ BRIDGE_IP=<device-ip> pytest tests/ -v
 ```
 tests/
   conftest.py           # Fixtures (bridge_url, etc.), markers, --run-destructive flag
-  test_integration.py   # 46 tests across 9 test classes
+  test_integration.py   # ~55 tests across 10 test classes
 pytest.ini              # Marker registration and default options
 ```
 
@@ -90,6 +99,7 @@ pytest.ini              # Marker registration and default options
 | `TestWebUI` | 3 | HTML pages load, contain expected elements |
 | `TestConfigModification` | 4 | Save/update/delete light config via REST API |
 | `TestBridgeToWledForwarding` | 1 | Light state changes forwarded to WLED device |
+| `TestSSE` | 4 | SSE event stream: initial events, concurrent REST, reconnect, keepalive |
 | `TestMatterProtocol` | 1 | Placeholder for future Matter-level tests (skipped) |
 
 Destructive tests (marked `@pytest.mark.destructive`) are skipped by default because
@@ -102,7 +112,7 @@ to include them.
 src/
   main.cpp              # Entry point: setup(), loop(), ArduinoOTA
   matter_manager.cpp    # Matter stack: node, endpoints, attribute callbacks
-  web_ui.cpp            # Web server, REST API, captive portal, WiFi management
+  web_ui.cpp            # esp_http_server, REST API, SSE, captive portal, WiFi management
   wled_output.cpp       # HTTP POST to WLED JSON API
   wled_discovery.cpp    # mDNS discovery of WLED devices
   config_store.cpp      # NVS persistence for light configuration
@@ -118,7 +128,7 @@ idf_component.yml       # ESP-IDF Component Manager manifest (esp_matter)
 
 ## Build System Notes
 
-- **Dual framework**: Arduino (web server, OTA, WiFi) + ESP-IDF (Matter SDK, mDNS, NVS)
+- **Dual framework**: Arduino (OTA, WiFi) + ESP-IDF (Matter SDK, mDNS, NVS, HTTP server)
 - Three Python pre/post scripts handle PlatformIO quirks for this dual-framework setup
 - `lib_ignore = Matter` prevents conflict with Arduino's built-in Matter library
 - `idf_component.yml` in root is the canonical manifest; `src/idf_component.yml` is
@@ -196,10 +206,11 @@ Project-local headers use `"quotes"`, everything else uses `<angle brackets>`.
 - Standard `setup()` / `loop()` entry points in `main.cpp`
 - `millis()` for non-blocking timing; avoid `delay()` except during init
 - `Preferences` API for application-level NVS storage
-- `PROGMEM` + `server.send_P()` for large static HTML
+- `PROGMEM` for large static HTML strings (served via `esp_http_server`)
 
 ### ESP-IDF Patterns
 - Direct NVS API (`nvs_open`/`nvs_close`) for Matter/CHIP namespaces
 - `esp_http_client` for outbound HTTP to WLED devices
+- `esp_http_server` for the web UI, REST API, and SSE event stream
 - `mdns_*` API for service discovery
 - `esp_matter::*` namespaced API for Matter SDK integration
