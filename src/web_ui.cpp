@@ -116,6 +116,7 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
                    background: #000; flex-shrink: 0; }
   .light-info { display: flex; flex-direction: column; gap: 4px; }
   .light-name { font-weight: bold; color: #e0e0e0; }
+  .light-name a:hover { text-decoration: underline; }
   .light-detail { font-size: 0.85em; color: #888; }
   .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;
          font-size: 0.9em; color: #fff; }
@@ -379,7 +380,7 @@ function renderLights() {
     return `<div class="card light">
       <div class="light-preview" id="preview-${i}"></div>
       <div class="light-info">
-        <div class="light-name">${escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
+        <div class="light-name">${l.wledHost ? `<a href="http://${escAttr(l.wledHost)}:${l.wledPort || 80}" target="_blank" rel="noopener" style="color:inherit;text-decoration:none" title="Open WLED UI">${escHtml(l.name)}</a>` : escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
         <div class="light-detail">${escHtml(l.wledHost || '(not set)')}:${l.wledPort || 80}</div>
       </div>
       <div>
