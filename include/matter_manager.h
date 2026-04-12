@@ -51,5 +51,8 @@ void matterGetPairingCode(char* out, size_t outLen);
 // Get the QR code payload string (MT:XXXXX format)
 void matterGetQRPayload(char* out, size_t outLen);
 
+// Get the Matter endpoint ID for a light index (0 if not yet assigned)
+uint16_t matterGetEndpointId(uint8_t index);
+
 // Perform a Matter-only factory reset (preserves WiFi credentials)
 void matterFactoryReset();

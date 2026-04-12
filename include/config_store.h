@@ -26,6 +26,7 @@ struct LightConfig {
   LightType type;
   char     wledHost[64];    // IP address or hostname of WLED device
   uint16_t wledPort;        // HTTP port (default 80)
+  char     mac[18];         // MAC address of WLED device (e.g. "AA:BB:CC:DD:EE:FF")
 };
 
 // Current state of a light (set by Matter, read by WLED output)

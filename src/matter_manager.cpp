@@ -64,6 +64,59 @@ struct EndpointInfo {
 };
 static EndpointInfo endpoints[MAX_LIGHTS] = {};
 
+// ── MAC-to-endpoint-ID registry ─────────────────────────────────────────────
+// We persist a mapping of WLED device MAC → Matter endpoint ID in a dedicated
+// NVS namespace ("mtwled_epmap").  On first boot for a given MAC, we use
+// esp_matter::endpoint::bridged_node::create() which auto-assigns an ID, then
+// save it.  On subsequent boots, we use bridged_node::resume() with the saved
+// ID so that Matter controllers recognise the device as the same one.
+//
+// NVS key format: MAC with colons stripped, e.g. "AABBCCDDEEFF" (12 chars).
+// NVS value: uint16_t endpoint ID.
+
+static const char *EP_MAP_NS = "mtwled_epmap";
+
+// Look up a previously-assigned endpoint ID for a MAC address.
+// Returns the endpoint ID, or 0 if not found.
+static uint16_t epMapLoad(const char *mac) {
+  if (!mac || mac[0] == '\0') return 0;
+
+  // Build NVS key: strip colons from MAC
+  char key[13] = {};
+  int k = 0;
+  for (int i = 0; mac[i] != '\0' && k < 12; i++) {
+    if (mac[i] != ':') key[k++] = mac[i];
+  }
+  key[k] = '\0';
+  if (k == 0) return 0;
+
+  nvs_handle_t h;
+  if (nvs_open(EP_MAP_NS, NVS_READONLY, &h) != ESP_OK) return 0;
+  uint16_t epId = 0;
+  nvs_get_u16(h, key, &epId);
+  nvs_close(h);
+  return epId;
+}
+
+// Save an endpoint ID for a MAC address.
+static void epMapSave(const char *mac, uint16_t epId) {
+  if (!mac || mac[0] == '\0') return;
+
+  char key[13] = {};
+  int k = 0;
+  for (int i = 0; mac[i] != '\0' && k < 12; i++) {
+    if (mac[i] != ':') key[k++] = mac[i];
+  }
+  key[k] = '\0';
+  if (k == 0) return;
+
+  nvs_handle_t h;
+  if (nvs_open(EP_MAP_NS, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_set_u16(h, key, epId);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
 // Light states (written by Matter callbacks, read by main loop for WLED output)
 static LightState lightStates[MAX_LIGHTS] = {};
 
@@ -477,6 +530,7 @@ static void doMatterFactoryReset() {
     "CHIP_KVS",
     "esp_matter_kvs",
     "node",
+    "mtwled_epmap",  // MAC→endpoint ID registry
   };
 
   ESP_LOGI("Matter", "Factory reset — erasing Matter NVS namespaces");
@@ -570,20 +624,58 @@ void matterSetup() {
   //    node carries its own bridged_device_basic_information cluster with a
   //    unique node_label — this is what gives each device its own name in
   //    Google Home, Apple Home, and Alexa.
+  //
+  //    If the WLED device has a known MAC with a previously-assigned endpoint
+  //    ID, we use resume() to re-create at the same ID.  Otherwise we use
+  //    create() and save the newly-assigned ID for next time.
   for (uint8_t i = 0; i < count; i++) {
     const LightConfig &cfg = configStore.getLight(i);
 
-    // 2a. Create bridged_node endpoint (automatically gets ENDPOINT_FLAG_DESTROYABLE)
+    // 2a. Create or resume the bridged_node endpoint
     esp_matter::endpoint::bridged_node::config_t bridgedCfg;
     bridgedCfg.bridged_device_basic_information.reachable = true;
 
-    esp_matter::endpoint_t *ep = esp_matter::endpoint::bridged_node::create(
-        mNode, &bridgedCfg,
-        esp_matter::ENDPOINT_FLAG_BRIDGE,
-        nullptr);
+    esp_matter::endpoint_t *ep = nullptr;
+    uint16_t savedEpId = epMapLoad(cfg.mac);
+
+    if (savedEpId != 0) {
+      // Known device — resume at the same endpoint ID
+      ep = esp_matter::endpoint::bridged_node::resume(
+          mNode, &bridgedCfg,
+          esp_matter::ENDPOINT_FLAG_BRIDGE,
+          savedEpId, nullptr);
+      if (ep) {
+        ESP_LOGI("Matter", "Resumed endpoint %d for MAC %s ('%s')",
+                 savedEpId, cfg.mac, cfg.name);
+      } else {
+        // resume() can fail if min_unused_endpoint_id was reset (e.g. after
+        // a Matter factory reset).  Fall through to create() below.
+        ESP_LOGW("Matter", "resume() failed for MAC %s ep=%d, falling back to create()",
+                 cfg.mac, savedEpId);
+      }
+    }
+
     if (!ep) {
-      ESP_LOGE("Matter", "Bridged node %d creation failed", i);
-      continue;
+      // New device (or resume failed) — create with auto-assigned ID
+      ep = esp_matter::endpoint::bridged_node::create(
+          mNode, &bridgedCfg,
+          esp_matter::ENDPOINT_FLAG_BRIDGE,
+          nullptr);
+      if (!ep) {
+        ESP_LOGE("Matter", "Bridged node %d creation failed", i);
+        continue;
+      }
+
+      // Save the newly-assigned endpoint ID keyed by MAC (if MAC is known)
+      uint16_t newEpId = esp_matter::endpoint::get_id(ep);
+      if (cfg.mac[0] != '\0') {
+        epMapSave(cfg.mac, newEpId);
+        ESP_LOGI("Matter", "Created endpoint %d for MAC %s ('%s') — saved to registry",
+                 newEpId, cfg.mac, cfg.name);
+      } else {
+        ESP_LOGW("Matter", "Created endpoint %d for '%s' — no MAC, cannot persist ID",
+                 newEpId, cfg.name);
+      }
     }
 
     // 2b. Set the aggregator as parent so the parts_list is populated correctly
@@ -632,9 +724,14 @@ void matterSetup() {
           bdbi, prodName, strlen(prodName));
 
       // unique_id — must be unique per bridged device for controller dedup.
-      //             Use "wled-<index>-<name>" to be stable across reboots.
+      //             Use MAC address if available (stable across reboots and
+      //             index changes), otherwise fall back to "wled-<index>-<name>".
       char uid[33] = {};
-      snprintf(uid, sizeof(uid), "wled-%d-%.24s", i, cfg.name);
+      if (cfg.mac[0] != '\0') {
+        snprintf(uid, sizeof(uid), "wled-%s", cfg.mac);
+      } else {
+        snprintf(uid, sizeof(uid), "wled-%d-%.24s", i, cfg.name);
+      }
       esp_matter::cluster::bridged_device_basic_information::attribute::create_unique_id(
           bdbi, uid, strlen(uid));
     } else {
@@ -715,6 +812,11 @@ void matterReportState(uint8_t index, const LightState& state) {
 void matterReconfigure() {
   reconfigPending = true;
   ESP_LOGW("Matter", "Light config changed. Restart required for Matter to pick up changes.");
+}
+
+uint16_t matterGetEndpointId(uint8_t index) {
+  if (index >= MAX_LIGHTS) return 0;
+  return endpoints[index].endpointId;
 }
 
 void matterGetPairingCode(char* out, size_t outLen) {

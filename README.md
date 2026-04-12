@@ -19,12 +19,13 @@ Apple Home / Google Home / Alexa
 
 - **Matter-compatible** — works with Apple Home, Google Home, and Alexa
 - **Bridge architecture** — each WLED device gets its own name in smart home apps
+- **Stable endpoint IDs** — MAC-based persistence keeps devices stable across reboots
 - **Up to 16 WLED lights** — each exposed as an independent bridged endpoint
 - **Full color control** — hue/saturation, CIE XY, and color temperature (mireds)
 - **mDNS auto-discovery** — finds WLED devices on your network automatically
 - **Web configuration UI** — captive portal for WiFi setup, device management
 - **WiFi-only commissioning** — no Bluetooth/BLE required
-- **OTA updates** — update firmware over the network via ArduinoOTA
+- **OTA updates** — update firmware over the network via ArduinoOTA or web UI
 - **Factory reset** — Matter-only reset preserves WiFi credentials
 
 ## Hardware
@@ -90,6 +91,10 @@ Endpoint 3  — Bridged Node + Extended Color Light (WLED device 2)
 
 Each bridged node carries a `bridged_device_basic_information` cluster (0x0039) with per-endpoint `node_label`, `product_name`, and `unique_id` attributes. This is what allows controllers like Google Home to display each WLED device with its own name instead of a single "WLED Bridge".
 
+### Endpoint ID Persistence
+
+Endpoint IDs are deterministic and stable across reboots. When a WLED device is first added, the Matter stack auto-assigns an endpoint ID via `bridged_node::create()`. The bridge saves a mapping of WLED MAC address to endpoint ID in the `mtwled_epmap` NVS namespace. On subsequent boots, `bridged_node::resume()` re-creates each endpoint at its saved ID, so Matter controllers recognise it as the same device. This prevents devices from appearing as "new" after a reboot or configuration change.
+
 ### Source Files
 
 | File | Purpose |
@@ -128,7 +133,7 @@ Reset Matter commissioning state without losing WiFi credentials:
 curl -X POST http://<device-ip>/api/matter/reset
 ```
 
-This erases Matter fabric data (`chip-config`, `chip-counters`, `chip-factory`, `CHIP_KVS`, `esp_matter_kvs`, `node` NVS namespaces) and restarts the device. WiFi credentials are preserved.
+This erases Matter fabric data (`chip-config`, `chip-counters`, `chip-factory`, `CHIP_KVS`, `esp_matter_kvs`, `node`, `mtwled_epmap` NVS namespaces) and restarts the device. WiFi credentials and light configuration are preserved, but endpoint IDs will be reassigned on next boot.
 
 ## Partition Table (8MB Flash — Default)
 
@@ -153,6 +158,19 @@ These are Matter test VID/PID values. They work for development and pairing with
 | Product ID | `0x8000` |
 | Passcode | `20202021` |
 | Discriminator | `3840` |
+
+## Testing
+
+Integration tests run against a live device over the network using pytest:
+
+```bash
+pip install pytest requests
+BRIDGE_IP=<device-ip> pytest tests/ -v
+```
+
+Tests cover the REST API (status, config, light states), WLED mDNS discovery, web UI, config persistence, and bridge-to-WLED forwarding. Run `pytest tests/ --run-destructive` to include tests that modify device state (factory reset, config wipe).
+
+See [AGENTS.md](AGENTS.md#tests) for full test documentation.
 
 ## Based On
 

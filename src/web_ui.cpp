@@ -287,6 +287,8 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <script>
 let config = { lights: [] };
 let isApMode = false;
+let selectedMac = '';  // MAC from WLED discovery selection
+let lightEpIds = [];   // Matter endpoint IDs per light (from /api/lights/state)
 
 async function loadStatus() {
   try {
@@ -333,6 +335,12 @@ async function loadLightStates() {
     const data = await r.json();
     const lights = data.lights || [];
     for (let i = 0; i < lights.length; i++) {
+      // Update endpoint ID display
+      if (lights[i].epId) {
+        lightEpIds[i] = lights[i].epId;
+        const epEl = document.getElementById('epid-' + i);
+        if (epEl) epEl.textContent = lights[i].epId;
+      }
       const el = document.getElementById('preview-' + i);
       if (!el) continue;
       const l = lights[i];
@@ -362,11 +370,12 @@ function renderLights() {
 
   list.innerHTML = config.lights.map((l, i) => {
     const tagClass = l.type === 'RGBW' ? 'tag-rgbw' : 'tag-rgb';
+    const epDisplay = lightEpIds[i] || '...';
     return `<div class="card light">
       <div class="light-preview" id="preview-${i}"></div>
       <div class="light-info">
         <div class="light-name">${escHtml(l.name)} <span class="tag ${tagClass}">${l.type}</span></div>
-        <div class="light-detail">WLED: ${escHtml(l.wledHost || '(not set)')}:${l.wledPort || 80} | Endpoint ${i + 1}</div>
+        <div class="light-detail">WLED: ${escHtml(l.wledHost || '(not set)')}:${l.wledPort || 80} | Endpoint <span id="epid-${i}">${epDisplay}</span></div>
       </div>
       <div>
         <button class="btn btn-sm" style="background:#0f3460" onclick="editLight(${i})">Edit</button>
@@ -389,6 +398,7 @@ function showAddLight() {
   document.getElementById('lightType').value = 'RGB';
   document.getElementById('wledHost').value = '';
   document.getElementById('wledPort').value = 80;
+  selectedMac = '';
   clearDiscovery();
   document.getElementById('lightModal').classList.add('active');
 }
@@ -401,6 +411,7 @@ function editLight(i) {
   document.getElementById('lightType').value = l.type;
   document.getElementById('wledHost').value = l.wledHost || '';
   document.getElementById('wledPort').value = l.wledPort || 80;
+  selectedMac = l.mac || '';
   clearDiscovery();
   document.getElementById('lightModal').classList.add('active');
 }
@@ -431,7 +442,7 @@ async function discoverWled() {
     } else {
       results.innerHTML = devices.map((d, i) => {
         const preferHost = d.hostname || d.host;
-        return `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(preferHost)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'})">
+        return `<div class="wled-device" onclick="selectWledDevice(this, '${escAttr(preferHost)}', ${d.port}, '${escAttr(d.name)}', ${d.isRGBW ? 'true' : 'false'}, '${escAttr(d.mac || '')}')">
           <div class="dev-name">${escHtml(d.name)}</div>
           <div class="dev-detail">${escHtml(d.hostname || '')}${d.hostname ? ' (' + escHtml(d.host) + ')' : escHtml(d.host)}:${d.port} | ${d.ledCount} LEDs | ${d.isRGBW ? 'RGBW' : 'RGB'} | v${escHtml(d.version)}</div>
         </div>`;
@@ -449,12 +460,13 @@ function escAttr(s) {
   return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
-function selectWledDevice(el, host, port, name, isRGBW) {
+function selectWledDevice(el, host, port, name, isRGBW, mac) {
   document.querySelectorAll('.wled-device').forEach(d => d.classList.remove('selected'));
   el.classList.add('selected');
   document.getElementById('wledHost').value = host;
   document.getElementById('wledPort').value = port;
   document.getElementById('lightType').value = isRGBW ? 'RGBW' : 'RGB';
+  selectedMac = mac || '';
   const nameField = document.getElementById('lightName');
   if (nameField.value.match(/^Light \d+$/)) {
     nameField.value = name;
@@ -468,6 +480,7 @@ async function saveLight() {
     type: document.getElementById('lightType').value,
     wledHost: document.getElementById('wledHost').value.trim(),
     wledPort: parseInt(document.getElementById('wledPort').value) || 80,
+    mac: selectedMac,
   };
 
   if (!light.wledHost) {
@@ -476,6 +489,10 @@ async function saveLight() {
   }
 
   if (idx >= 0) {
+    // Preserve existing MAC if not overridden by a new discovery selection
+    if (!light.mac && config.lights[idx].mac) {
+      light.mac = config.lights[idx].mac;
+    }
     config.lights[idx] = light;
   } else {
     config.lights.push(light);
@@ -688,6 +705,7 @@ static void setupRoutes() {
       JsonObject obj = arr.add<JsonObject>();
       obj["on"] = st.powerOn;
       obj["bri"] = st.brightness;
+      obj["epId"] = matterGetEndpointId(i);
       float briScale = st.powerOn ? (static_cast<float>(st.brightness) / 254.0f) : 0.0f;
       obj["r"] = static_cast<uint8_t>(st.red * briScale);
       obj["g"] = static_cast<uint8_t>(st.green * briScale);

@@ -63,6 +63,9 @@ void ConfigStore::save() {
 
     snprintf(key, sizeof(key), "l%d_port", i);
     prefs.putUShort(key, lights[i].wledPort);
+
+    snprintf(key, sizeof(key), "l%d_mac", i);
+    prefs.putString(key, lights[i].mac);
   }
 
   prefs.end();
@@ -97,6 +100,10 @@ void ConfigStore::load() {
     snprintf(key, sizeof(key), "l%d_port", i);
     lights[i].wledPort = prefs.getUShort(key, 80);
 
+    snprintf(key, sizeof(key), "l%d_mac", i);
+    String mac = prefs.getString(key, "");
+    strlcpy(lights[i].mac, mac.c_str(), sizeof(lights[i].mac));
+
     lights[i].active = true;
   }
 
@@ -113,6 +120,7 @@ void ConfigStore::toJson(JsonDocument& doc) const {
     light["type"] = (lights[i].type == LIGHT_TYPE_RGBW) ? "RGBW" : "RGB";
     light["wledHost"] = lights[i].wledHost;
     light["wledPort"] = lights[i].wledPort;
+    light["mac"] = lights[i].mac;
   }
 }
 
@@ -150,6 +158,9 @@ bool ConfigStore::fromJson(const JsonDocument& doc) {
     strlcpy(cfg.wledHost, host, sizeof(cfg.wledHost));
 
     cfg.wledPort = light["wledPort"] | 80;
+
+    const char* mac = light["mac"] | "";
+    strlcpy(cfg.mac, mac, sizeof(cfg.mac));
 
     count++;
   }
