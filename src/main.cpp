@@ -25,6 +25,7 @@
 #include "wled_output.h"
 #include "web_ui.h"
 #include "matter_manager.h"
+#include "log_buffer.h"
 
 // WLED update rate: 2Hz
 static const unsigned long WLED_UPDATE_INTERVAL_MS = 500;
@@ -32,6 +33,7 @@ static unsigned long lastWledUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
+  logBufferInit();
   delay(1000);
 
   ESP_LOGI("Main", "=== Matter WiFi WLED Bridge ===");

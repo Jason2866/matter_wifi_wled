@@ -15,7 +15,9 @@
  */
 
 #include "web_ui.h"
+#include "log_buffer.h"
 #include "config_store.h"
+#include "usage_reporter.h"
 #include "wled_output.h"
 #include "wled_discovery.h"
 #include "matter_manager.h"
@@ -160,6 +162,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
   .pairing-info .code { font-size: 1.3em; color: #00d4ff; letter-spacing: 2px; }
   .pairing-info .qr-link { font-size: 0.85em; color: #aaa; margin-top: 4px; }
   .pairing-info .qr-link a { color: #00d4ff; }
+  #logOutput { background: #0a0a1a; color: #b0ffb0; font-family: 'Courier New', monospace;
+               font-size: 0.78em; border: 1px solid #0f3460; border-radius: 4px; padding: 10px;
+               height: 280px; overflow-y: auto; white-space: pre; word-break: break-all;
+               margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -241,6 +247,41 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div id="otaStatus" style="font-size:0.85em;color:#aaa;margin-top:4px">Uploading...</div>
     </div>
   </form>
+</div>
+
+<!-- Device Logs -->
+<div class="card" style="margin-top:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+    <h3 style="color:#00d4ff">Device Logs</h3>
+    <div style="display:flex;gap:8px;align-items:center">
+      <label style="display:flex;align-items:center;gap:4px;margin:0;font-size:0.85em;cursor:pointer">
+        <input type="checkbox" id="logAutoRefresh" onchange="toggleLogAutoRefresh()">
+        Auto
+      </label>
+      <button class="btn btn-sm" style="background:#0f3460" onclick="refreshLogs()">Refresh</button>
+      <button class="btn btn-danger btn-sm" onclick="clearLogs()">Clear</button>
+    </div>
+  </div>
+  <div id="logOutput">(click Refresh to load logs)</div>
+</div>
+
+<!-- Usage Reporting Consent Modal -->
+<div class="modal" id="usageModal">
+  <div class="modal-content">
+    <div class="modal-title" id="usageModalTitle">Thank you for installing Matter WiFi WLED Bridge!</div>
+    <p style="color:#ccc;margin-bottom:12px" id="usageModalDesc"></p>
+    <p style="color:#ccc;margin-bottom:12px">Help make Matter WiFi WLED Bridge better by sharing anonymous hardware details like chip type and LED count. This helps us understand how the bridge is used — no personal data or network activity is ever collected.</p>
+    <div style="margin-bottom:16px">
+      <label style="display:flex;align-items:center;gap:8px;color:#ccc;cursor:pointer;margin-bottom:0">
+        <input type="checkbox" id="usageSaveChoice">
+        <span>Save my choice for future updates</span>
+      </label>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" style="background:#444" onclick="usageRespond(false)">Skip</button>
+      <button class="btn btn-primary" onclick="usageRespond(true)">Report update</button>
+    </div>
+  </div>
 </div>
 
 <!-- Add/Edit Light Modal -->
@@ -658,9 +699,115 @@ function startSSE() {
   };
 }
 
+// ---- Usage Reporting ----
+let usageInfo = null;
+
+async function checkUsageReport() {
+  if (isApMode) return; // no internet access in AP mode
+  try {
+    const r = await fetch('/api/usage-info');
+    usageInfo = await r.json();
+    if (usageInfo.alwaysReport) {
+      await sendUsageReport(usageInfo);
+      await saveUsageConsent(true, true);
+    } else if (usageInfo.shouldPrompt) {
+      showUsagePrompt(usageInfo);
+    }
+  } catch(e) {
+    console.log('Usage check failed:', e);
+  }
+}
+
+function showUsagePrompt(info) {
+  const isInstall = !info.previousVersion || info.previousVersion === '0.0.0';
+  document.getElementById('usageModalTitle').textContent = isInstall
+    ? 'Thank you for installing Matter WiFi WLED Bridge!'
+    : 'Matter WiFi WLED Bridge updated!';
+  document.getElementById('usageModalDesc').textContent = isInstall
+    ? 'You are running version ' + info.version + '.'
+    : 'Updated from ' + info.previousVersion + ' to ' + info.version + '.';
+  document.getElementById('usageModal').classList.add('active');
+}
+
+async function usageRespond(consent) {
+  document.getElementById('usageModal').classList.remove('active');
+  const remember = document.getElementById('usageSaveChoice').checked;
+  if (consent && usageInfo) {
+    try { await sendUsageReport(usageInfo); } catch(e) { console.log('Usage report failed:', e); }
+  }
+  await saveUsageConsent(consent, remember);
+}
+
+async function sendUsageReport(info) {
+  const payload = {
+    deviceId:         info.deviceId,
+    version:          info.version,
+    previousVersion:  info.previousVersion,
+    releaseName:      info.releaseName,
+    chip:             info.chip,
+    ledCount:         info.ledCount,
+    isMatrix:         info.isMatrix,
+    bootloaderSHA256: info.bootloaderSHA256,
+    brand:            info.brand,
+    flashSize:        info.flashSize,
+    repo:             info.repo,
+    integrations:     info.integrations
+  };
+  await fetch('https://usage.wled.me/api/usage/upgrade', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+}
+
+async function saveUsageConsent(consent, remember) {
+  try {
+    await fetch('/api/usage-consent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ consent, remember })
+    });
+  } catch(e) { console.log('Failed to save consent:', e); }
+}
+
+// ---- Device Logs ----
+let logAutoTimer = null;
+
+async function refreshLogs() {
+  const el = document.getElementById('logOutput');
+  try {
+    const r = await fetch('/api/logs');
+    const text = await r.text();
+    el.textContent = text;
+    el.scrollTop = el.scrollHeight;
+  } catch(e) {
+    el.textContent = 'Failed to load logs: ' + e.message;
+  }
+}
+
+async function clearLogs() {
+  try {
+    await fetch('/api/logs/clear', { method: 'POST' });
+    document.getElementById('logOutput').textContent = '(log buffer cleared)';
+  } catch(e) {
+    alert('Failed to clear logs: ' + e.message);
+  }
+}
+
+function toggleLogAutoRefresh() {
+  if (document.getElementById('logAutoRefresh').checked) {
+    refreshLogs();
+    logAutoTimer = setInterval(refreshLogs, 3000);
+  } else {
+    clearInterval(logAutoTimer);
+    logAutoTimer = null;
+  }
+}
+
 // Initial load - fetch config and status, then start SSE
 Promise.all([loadStatus(), loadConfig()]).then(() => {
   document.getElementById('loadingState')?.remove();
+  checkUsageReport();
   if (useSSE) {
     startSSE();
   } else {
@@ -929,6 +1076,33 @@ static esp_err_t handleRestart(httpd_req_t *req) {
   delay(1000);
   ESP.restart();
   return ESP_OK;
+}
+
+// GET /api/logs — return recent log ring buffer as plain text
+static esp_err_t handleLogs(httpd_req_t *req) {
+  size_t sz = logBufferSize();
+  if (sz == 0) {
+    httpd_resp_set_type(req, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, "(log buffer empty)", HTTPD_RESP_USE_STRLEN);
+  }
+  char *tmp = static_cast<char *>(malloc(sz + 1));
+  if (!tmp) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    return httpd_resp_send(req, "OOM", HTTPD_RESP_USE_STRLEN);
+  }
+  size_t len = logBufferRead(tmp, sz + 1);
+  httpd_resp_set_type(req, "text/plain; charset=utf-8");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  esp_err_t err = httpd_resp_send(req, tmp, static_cast<ssize_t>(len));
+  free(tmp);
+  return err;
+}
+
+// POST /api/logs/clear — zero the ring buffer
+static esp_err_t handleLogsClear(httpd_req_t *req) {
+  logBufferClear();
+  return sendJson(req, "{\"ok\":true}");
 }
 
 // POST /api/ota — multipart firmware upload
@@ -1370,6 +1544,29 @@ static void ssePollAndPush() {
   }
 }
 
+// GET /api/usage-info
+static esp_err_t handleUsageInfo(httpd_req_t *req) {
+  return sendJson(req, usageGetInfoJson());
+}
+
+// POST /api/usage-consent
+static esp_err_t handleUsageConsent(httpd_req_t *req) {
+  String body = readRequestBody(req);
+  if (body.length() == 0) {
+    return sendJsonError(req, 400, "No body");
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, body)) {
+    return sendJsonError(req, 400, "Invalid JSON");
+  }
+
+  bool consent = doc["consent"] | false;
+  bool remember = doc["remember"] | false;
+  usageSaveConsent(consent, remember);
+  return sendJson(req, "{\"ok\":true}");
+}
+
 // Catch-all handler for captive portal redirect / 404
 static esp_err_t handleNotFound(httpd_req_t *req) {
   if (apMode) {
@@ -1473,6 +1670,24 @@ static void setupRoutes() {
   };
   httpd_register_uri_handler(httpServer, &restartUri);
 
+  // GET /api/logs
+  static const httpd_uri_t logsUri = {
+    .uri       = "/api/logs",
+    .method    = HTTP_GET,
+    .handler   = handleLogs,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &logsUri);
+
+  // POST /api/logs/clear
+  static const httpd_uri_t logsClearUri = {
+    .uri       = "/api/logs/clear",
+    .method    = HTTP_POST,
+    .handler   = handleLogsClear,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &logsClearUri);
+
   // POST /api/ota
   static const httpd_uri_t otaUri = {
     .uri       = "/api/ota",
@@ -1490,6 +1705,24 @@ static void setupRoutes() {
     .user_ctx  = nullptr
   };
   httpd_register_uri_handler(httpServer, &eventsUri);
+
+  // GET /api/usage-info
+  static const httpd_uri_t usageInfoUri = {
+    .uri       = "/api/usage-info",
+    .method    = HTTP_GET,
+    .handler   = handleUsageInfo,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &usageInfoUri);
+
+  // POST /api/usage-consent
+  static const httpd_uri_t usageConsentUri = {
+    .uri       = "/api/usage-consent",
+    .method    = HTTP_POST,
+    .handler   = handleUsageConsent,
+    .user_ctx  = nullptr
+  };
+  httpd_register_uri_handler(httpServer, &usageConsentUri);
 }
 
 // ── Public functions ────────────────────────────────────────────────────────
@@ -1537,7 +1770,7 @@ void webSetup() {
 
   // Configure and start the ESP-IDF HTTP server
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 20;
   config.stack_size = 8192;
   config.uri_match_fn = httpd_uri_match_wildcard;
   config.lru_purge_enable = true;
