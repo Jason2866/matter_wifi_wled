@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size,    Flags
+# Partition table for classic ESP32 with 4MB Flash — single app, no OTA
+# App partition: ~3.375MB (no OTA support; USB flashing only)
+# NVS: 20KB for config + Matter KVS
+# Filesystem: 384KB
+nvs,      data, nvs,     0x9000,  0x5000,
+app0,     app,  factory, 0x10000, 0x360000,
+spiffs,   data, spiffs,  0x370000,0x80000,
+coredump, data, coredump,0x3F0000,0x10000,
