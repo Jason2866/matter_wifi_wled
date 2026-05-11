@@ -1,6 +1,7 @@
 name: Build & Release
 
 on:
+  workflow_dispatch:      # Start a workflow manually
   push:
     branches: [main]
     tags: ['v*']
