@@ -21,29 +21,23 @@ jobs:
         include:
           - env: esp32s3
             chip_family: ESP32-S3
-            bootloader_offset: 0
           - env: esp32
             chip_family: ESP32
-            bootloader_offset: 4096
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache PlatformIO
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/pip
-            ~/.platformio
-          key: pio-${{ matrix.env }}-${{ hashFiles('platformio.ini') }}
-
+      - uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
-
-      - name: Install PlatformIO
-        run: pip install platformio
+          python-version: "3.13"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+      - name: Install pio
+        run: |
+          uv pip install --system pioarduino
 
       - name: Build firmware
         run: pio run -e ${{ matrix.env }}
@@ -51,12 +45,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           mkdir -p release
-          cp .pio/build/${{ matrix.env }}/bootloader.bin    release/bootloader.bin
-          cp .pio/build/${{ matrix.env }}/partitions.bin     release/partitions.bin
-          cp .pio/build/${{ matrix.env }}/firmware.bin        release/firmware.bin
-          if [ -f .pio/build/${{ matrix.env }}/boot_app0.bin ]; then
-            cp .pio/build/${{ matrix.env }}/boot_app0.bin release/boot_app0.bin
-          fi
+          cp .pio/build/${{ matrix.env }}/firmware.factory.bin        release/firmware.factory.bin
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
@@ -105,25 +94,11 @@ jobs:
           mkdir -p site/esp32s3 site/esp32
 
           # Copy firmware binaries into per-target directories
-          cp firmware-esp32s3/bootloader.bin site/esp32s3/
-          cp firmware-esp32s3/partitions.bin site/esp32s3/
-          cp firmware-esp32s3/firmware.bin   site/esp32s3/
-          [ -f firmware-esp32s3/boot_app0.bin ] && cp firmware-esp32s3/boot_app0.bin site/esp32s3/
-
-          cp firmware-esp32/bootloader.bin site/esp32/
-          cp firmware-esp32/partitions.bin site/esp32/
-          cp firmware-esp32/firmware.bin   site/esp32/
-          [ -f firmware-esp32/boot_app0.bin ] && cp firmware-esp32/boot_app0.bin site/esp32/
+          cp firmware-esp32s3/firmware.factory.bin   site/esp32s3/
+          cp firmware-esp32/firmware.factory.bin  site/esp32/
 
           VERSION="${{ steps.version.outputs.version }}"
 
-          # ESP32-S3: bootloader@0x0, partitions@0x8000, otadata@0xE000, app@0x10000
-          BOOT_APP0_S3=""
-          [ -f firmware-esp32s3/boot_app0.bin ] && BOOT_APP0_S3='{"path": "esp32s3/boot_app0.bin", "offset": 57344},'
-
-          # ESP32: bootloader@0x1000, partitions@0x8000, otadata@0xE000, app@0x10000
-          BOOT_APP0_32=""
-          [ -f firmware-esp32/boot_app0.bin ] && BOOT_APP0_32='{"path": "esp32/boot_app0.bin", "offset": 57344},'
 
           cat > site/manifest.json << MANIFEST
           {
@@ -134,19 +109,13 @@ jobs:
               {
                 "chipFamily": "ESP32-S3",
                 "parts": [
-                  { "path": "esp32s3/bootloader.bin", "offset": 0 },
-                  { "path": "esp32s3/partitions.bin", "offset": 32768 },
-                  ${BOOT_APP0_S3}
-                  { "path": "esp32s3/firmware.bin",   "offset": 65536 }
+                  { "path": "esp32s3/firmware.factory.bin",   "offset": 0 }
                 ]
               },
               {
                 "chipFamily": "ESP32",
                 "parts": [
-                  { "path": "esp32/bootloader.bin", "offset": 4096 },
-                  { "path": "esp32/partitions.bin", "offset": 32768 },
-                  ${BOOT_APP0_32}
-                  { "path": "esp32/firmware.bin",   "offset": 65536 }
+                  { "path": "esp32/firmware.factory.bin",   "offset": 0 }
                 ]
               }
             ]
