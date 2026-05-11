@@ -115,6 +115,29 @@
     footer a { color: var(--accent); text-decoration: none; }
     footer a:hover { text-decoration: underline; }
 
+    .baud-rate-select {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.9rem;
+      color: var(--text);
+    }
+    .baud-rate-select label {
+      color: var(--muted);
+    }
+    .baud-rate-select select {
+      padding: 0.4rem 0.6rem;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--card);
+      color: var(--text);
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    .baud-rate-select select:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
     .browser-warning {
       display: none;
       background: #fff3cd;
@@ -151,7 +174,18 @@
           Connect your ESP32 or ESP32-S3 via USB, then click the button below.<br />
           The correct firmware will be selected automatically based on your chip.
         </p>
-        <esp-web-install-button manifest="manifest.json">
+        <div class="baud-rate-select">
+          <label for="baud-rate">Baud rate:</label>
+          <select id="baud-rate">
+            <option value="115200">115200</option>
+            <option value="230400">230400</option>
+            <option value="460800">460800</option>
+            <option value="921600">921600</option>
+            <option value="1500000" selected>1500000 (default)</option>
+            <option value="2000000">2000000 (fast)</option>
+          </select>
+        </div>
+        <esp-web-install-button id="install-btn" manifest="manifest.json" baud-rate="1500000">
           <button slot="activate">Install Matter WLED Bridge</button>
           <span slot="unsupported">
             Your browser does not support Web Serial.<br />
@@ -201,6 +235,12 @@
     if (!("serial" in navigator)) {
       document.getElementById("browser-warning").style.display = "block";
     }
+
+    const baudRateSelect = document.getElementById("baud-rate");
+    const installBtn = document.getElementById("install-btn");
+    baudRateSelect.addEventListener("change", (e) => {
+      installBtn.setAttribute("baud-rate", e.target.value);
+    });
   </script>
 </body>
 </html>
