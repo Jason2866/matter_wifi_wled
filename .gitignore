@@ -1,5 +1,7 @@
 # PlatformIO build artifacts
 .pio/
+.cache
+compile_commands.json
 
 # Generated idf_component.yml in src/
 src/idf_component.yml
